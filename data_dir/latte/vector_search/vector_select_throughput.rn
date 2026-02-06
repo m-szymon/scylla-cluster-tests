@@ -1,0 +1,164 @@
+use latte::*;
+
+
+const KEYSPACE = latte::param!("keyspace", "myapp");
+const TABLE = latte::param!("table", "comments");
+const REPLICATION_FACTOR = latte::param!("replication_factor", 1);
+const IS_SCHEMA_CREATION = latte::param!("is_schema_creation", false);
+
+const SELECT_LIMIT = latte::param!("select_limit", 100);
+//const DATASET_SIZE = latte::param!("dataset_size", 50000);
+
+const VECTOR_DATA_DIR = latte::param!("vector_data_dir", "data_dir/latte/vector_search/");
+const PARSING_DELIMITER = ", ";
+
+const P_STMT = #{
+    "INSERT": #{
+        "NAME": "p_stmt_insert",
+        "CQL": `INSERT INTO ${KEYSPACE}.${TABLE} (id, comment_vector, comment_string) VALUES (:id, :vector, :string)`,
+    },
+    "SELECT_ID": #{
+        "NAME": "p_stmt_select_id",
+        "CQL": `SELECT id FROM ${KEYSPACE}.${TABLE} LIMIT ${SELECT_LIMIT}`,
+    },
+    "SELECT_FULL": #{
+        "NAME": "p_stmt_select_full",
+        "CQL": `SELECT id, comment_vector FROM ${KEYSPACE}.${TABLE} LIMIT ${SELECT_LIMIT}`,
+    },
+    "SELECT_STRING": #{
+        "NAME": "p_stmt_select_string",
+        "CQL": `SELECT id, comment_string FROM ${KEYSPACE}.${TABLE} LIMIT ${SELECT_LIMIT}`,
+    },
+    "SELECT_FUNC": #{
+        "NAME": "p_stmt_select_full",
+        "CQL": `SELECT id, similarity_cosine(comment_vector, comment_vector) FROM ${KEYSPACE}.${TABLE} LIMIT ${SELECT_LIMIT}`,
+    }
+};
+
+
+pub async fn schema(db) {
+    db.execute(`CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH REPLICATION = {
+        'class': 'NetworkTopologyStrategy', 'replication_factor': '${REPLICATION_FACTOR}'} AND durable_writes = true`).await?;
+
+    db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (
+        id int,
+        comment_vector vector<float, 1536>,
+        comment_string text,
+        PRIMARY KEY (id)
+    ) WITH bloom_filter_fp_chance = 0.01
+        AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+        AND compaction = {'class': 'IncrementalCompactionStrategy'}
+        AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}`).await?;
+}
+
+pub async fn erase(db) {
+   db.execute(`TRUNCATE TABLE ${KEYSPACE}.${TABLE}`).await?;
+}
+
+pub async fn prepare(db) {
+    // Run different preparation steps based on the function type
+    if IS_SCHEMA_CREATION {
+        db.prepare(P_STMT.INSERT.NAME, P_STMT.INSERT.CQL).await?;
+        prepare_dataset(db).await?;
+    }
+    else {
+        db.prepare(P_STMT.SELECT_ID.NAME, P_STMT.SELECT_ID.CQL).await?;
+        db.prepare(P_STMT.SELECT_FULL.NAME, P_STMT.SELECT_FULL.CQL).await?;
+        db.prepare(P_STMT.SELECT_STRING.NAME, P_STMT.SELECT_STRING.CQL).await?;
+        db.prepare(P_STMT.SELECT_FUNC.NAME, P_STMT.SELECT_FUNC.CQL).await?;
+    }
+}
+
+////////////////////
+// User functions //
+////////////////////
+
+pub async fn insert(db, i) {
+    // Get the line for this iteration (dataset loaded in prepare phase)
+    let row_to_insert = db.data.dataset[i];
+
+    let params = #{ "id": row_to_insert.id, "vector": row_to_insert.vectors, "string": row_to_insert.strings };
+    db.execute_prepared(P_STMT.INSERT.NAME, params).await?;
+}
+
+pub async fn select_id_only(db, _i) {
+    // Simple SELECT without parameters - just fetch first N rows
+    let params = #{};
+    db.execute_prepared(P_STMT.SELECT_ID.NAME, params).await?;
+}
+
+pub async fn select_with_vector(db, _i) {
+    // SELECT with vector column - tests data transfer overhead
+    let params = #{};
+    db.execute_prepared(P_STMT.SELECT_FULL.NAME, params).await?;
+}
+
+pub async fn select_with_string(db, _i) {
+    // SELECT with string column - tests data transfer overhead
+    let params = #{};
+    db.execute_prepared(P_STMT.SELECT_STRING.NAME, params).await?;
+}
+
+pub async fn select_with_func(db, _i) {
+    // SELECT with function on vector column - tests computation overhead
+    let params = #{};
+    db.execute_prepared(P_STMT.SELECT_FUNC.NAME, params).await?;
+}
+
+///////////////////////
+// Utility functions //
+///////////////////////
+
+fn strip_surrounding_brackets(s) {
+    let cleaned = s;
+    if s.len() > 0 {
+        let chars = s.chars().collect::<Vec>();
+        let first_char = chars[0];
+        let last_idx = s.len() - 1;
+        let last_char = chars[last_idx];
+
+        if first_char == '[' && last_char == ']' {
+            cleaned = s[1..last_idx];
+        }
+    }
+    cleaned
+}
+
+pub async fn prepare_dataset(db) {
+    let dataset_path = VECTOR_DATA_DIR + "vs_sanity_dataset_50k_1536dim.txt";
+    let maxsplit = 1;
+    let file_iterator = fs::read_split_lines_iter(dataset_path, [PARSING_DELIMITER, maxsplit])?;
+
+    db.data.dataset = [];
+    while let Some(_entry) = file_iterator.next() {
+        let raw_entry = _entry?;
+        if !raw_entry.is_empty() {
+            let id = raw_entry[0].parse::<i64>()?;
+
+            let vectors = [];
+            let raw_vectors = strip_surrounding_brackets(raw_entry[1]);
+            let vector_strings = raw_vectors.split(',').collect::<Vec>();
+
+            for vector_str in vector_strings {
+                vectors.push(f64::parse(vector_str.trim())?);
+            }
+
+            // Create fixed-size string (6144 bytes)
+            let byte_limit = 4 * 1536;
+            let string_bytes = if raw_vectors.len() >= byte_limit {
+                raw_vectors[0..byte_limit]
+            } else {
+                raw_vectors
+            };
+            for i in raw_vectors.len()..byte_limit {
+                string_bytes = string_bytes + "!";
+            }
+
+            let entry = #{ "id": id, "vectors": vectors, "strings": string_bytes };
+            db.data.dataset.push(entry)
+        }
+    }
+    println!("Loaded {} dataset lines", db.data.dataset.len());
+
+    Ok(())
+}

@@ -1,0 +1,47 @@
+test_duration: 60  # Total test duration in minutes
+
+# Data preparation phase - insert 50K vectors
+prepare_write_cmd:
+  - >-
+    latte run --function insert --threads 4 --rate 500 --duration 50000 -P is_schema_creation=true -P replication_factor=1
+    data_dir/latte/vector_search/vector_select_throughput.rn
+
+# Stress phase - run SELECT queries with longer duration for statistical significance
+stress_cmd:
+  # Test 1: SELECT id only (minimal data transfer) - warmup
+  - >-
+    latte run --function select_with_vector --connections 1 --threads 1 --concurrency 1
+    --duration 180s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 2: SELECT id with full vector (1536 dimensions per row)
+  - >-
+    latte run --function select_with_vector --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 3: SELECT id with bytes (4*1536 size per row)
+  - >-
+    latte run --function select_with_string --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 4: SELECT id with func on vector
+  - >-
+    latte run --function select_with_func --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 1: SELECT id only (minimal data transfer) - warmup
+  - >-
+    latte run --function select_id_only --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+
+n_db_nodes: 1
+#instance_type_loader: 'r7i.4xlarge'
+#instance_type_db: 'i8g.xlarge'
+instance_type_loader: 'c6i.2xlarge'
+instance_type_db: 'i4i.large'
+root_disk_size_loader: 30  # GB - default is 20GB, dataset is 1.7GB
+n_loaders: 1
+n_vector_store_nodes: 0  # Not needed for plain SELECT queries
+
+download_from_s3:
+  - data_dir/latte/vector_search:
+     - 's3://vector-search-sct/'
+
+user_prefix: 'vector-select-throughput'
+
+use_preinstalled_scylla: true
