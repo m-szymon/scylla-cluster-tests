@@ -1,16 +1,33 @@
 test_duration: 60
 
+# Data preparation phase - insert 50K vectors
 prepare_write_cmd:
   - >-
-    latte run --function insert --threads 4 --rate 500 --duration 50000 -P is_schema_creation=true
-    data_dir/latte/vector_search/vector_search_recall.rn
+    latte run --function insert --threads 4 --rate 500 --duration 50000 -P is_schema_creation=true -P replication_factor=1
+    data_dir/latte/vector_search/vector_select_throughput.rn
 
-# Make sure values in `--rate` == `-P recall_validation_rate` and `--duration` == -P recall_validation_duration`
-# Latte don't have access to non-custom parameters in runtime of prepare function
+# Stress phase - run SELECT queries with longer duration for statistical significance
 stress_cmd:
+  # Test 1: SELECT id only (minimal data transfer) - warmup
   - >-
-    latte run --function validate_average_recall --connections 2 --rate 350 -P recall_validation_rate=350
-    --duration 300s -P recall_validation_duration=300 data_dir/latte/vector_search/vector_search_recall.rn
+    latte run --function select_with_vector --connections 1 --threads 1 --concurrency 1
+    --duration 180s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 2: SELECT id with full vector (1536 dimensions per row)
+  - >-
+    latte run --function select_with_vector --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 3: SELECT id with bytes (4*1536 size per row)
+  - >-
+    latte run --function select_with_string --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 4: SELECT id with func on vector
+  - >-
+    latte run --function select_with_func --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
+  # Test 1: SELECT id only (minimal data transfer) - warmup
+  - >-
+    latte run --function select_id_only --connections 1 --threads 1 --concurrency 1
+    --duration 120s data_dir/latte/vector_search/vector_select_throughput.rn
 
 n_db_nodes: 3
 instance_type_loader: 'c6i.2xlarge'
