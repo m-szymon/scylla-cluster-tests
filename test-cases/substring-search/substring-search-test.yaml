@@ -1,0 +1,184 @@
+# Substring search (LIKE '%keyword%') performance test on AWS, normally driven from a developer
+# machine rather than from Jenkins.
+#
+# What it answers: what a containment query costs at 10M names -- latency at a ladder of rates up to
+# and past the 10k ops/s the design targets, and the throughput ceiling -- plus how much memory the
+# index costs per indexed name. The default plan indexes while it loads, so it does not time the
+# build; point 'search_test_config' at aws_build_config.yaml for that.
+#
+# Prerequisites, all three of them real:
+#   1. The vector-store branch pushed to the fork named below: the VS node builds it from git.
+#   2. A Scylla unified package built from the scylladb branch and reachable by URL, since the db
+#      node installs a package rather than cloning a branch. See 'unified_package' below.
+#   3. The corpus generated on this machine (about 250 MB, a few minutes):
+#        python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#            --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
+#
+# Run (see docs/substring-search-test.md for the full walk-through):
+#   export SCT_ENABLE_ARGUS=false
+#   export SCT_UNIFIED_PACKAGE=https://.../scylla-unified-....tar.gz
+#   ./sct.py run-test substring_test.SubstringSearchTest.test_substring_search --backend aws \
+#       --config test-cases/substring-search/substring-search-test.yaml
+#
+
+test_metadata:
+  description: >-
+    Substring search performance test on AWS. Loads display names into ScyllaDB, builds a
+    substring_index on a vector-store node, and runs latte query sets of 1, 2 and 4 character
+    keywords at configured concurrency and rate. Reports index build time and indexing throughput
+    (measured by SCT from vector-store's own 'full scan' log lines), the index size read from
+    vector-store's gauges, and per-query-set search latency.
+  test_type: performance
+  tier: ondemand
+  duration_class: long
+  supported_backends:
+    - aws
+  stress_tools:
+    - latte
+  workload: read
+  nemesis_labels: []
+  features:
+    - tablets
+
+# The budget for the whole run: loading 10M names through one loader while the index ingests behind
+# it, then thirteen query phases of two minutes each. Raise it with SCT_TEST_DURATION if the plan
+# grows, and note aws_build_config.yaml needs considerably more.
+test_duration: 720
+
+# Required: latency_calculator_decorator returns early without it.
+use_hdrhistogram: true
+
+n_db_nodes: 1
+n_loaders: 1
+n_vector_store_nodes: 1
+# Kept at 1 because this is a latency test: without monitoring the HDR percentiles from latte still
+# arrive, but the server side latencies, the reactor stall counters and the Grafana screenshots do
+# not, and those are what tell you whether a p99 came from Scylla or from the index node. Set
+# SCT_N_MONITOR_NODES=0 to save the instance.
+n_monitor_nodes: 1
+
+# Build vector-store from source: no released build has the substring index. Setting either
+# 'vector_store_source_ref' or 'vector_store_source_repo' switches provisioning to a source build
+# over the newest vector-store AMI for the architecture.
+# The value is handed to 'git remote add' on the node, so it is a URL, not 'owner/name'.
+vector_store_source_repo: 'https://github.com/m-szymon/vector-store.git'
+vector_store_source_ref: 'substring-index'
+
+# Scylla also needs a build with substring_index support and there is no released one, but it does
+# not need a custom AMI: 'unified_package' takes the URL of a relocatable package, and SCT then
+# provisions a stock Ubuntu 24.04 image and installs it (sct_config.py section 6.0.1, which also
+# forces use_preinstalled_scylla=False). Build it from the branch and host it anywhere the node can
+# reach:
+#   ./tools/toolchain/dbuild ninja dist-unified-dev
+#   # -> build/dev/dist/tar/scylla-unified-<version>.<arch>.tar.gz
+#   aws s3 cp <that file> s3://<your-bucket>/ --acl public-read
+#   export SCT_UNIFIED_PACKAGE=https://<your-bucket>.s3.amazonaws.com/<that file>
+# Deliberately not pinned here, since the URL is yours. Supplying neither this nor
+# SCT_AMI_ID_DB_SCYLLA fails at config validation, which is the intended failure: a released Scylla
+# would reject the CREATE CUSTOM INDEX statement much later and much less clearly.
+
+# The database stores only short names, but it is not idle during the query phases: every containment
+# query comes back as up to 'limit' primary keys and Scylla then reads those rows from the base
+# table, so 10k queries/s at a limit of 20 is 200k row reads/s here. If the run falls short of the
+# target rate, this node and the loader are the first two places to look, ahead of the index node.
+instance_type_db: 'i4i.xlarge'
+# Two vCPUs are not enough to push the unthrottled query phases at the rate this test aims for, and
+# a saturated loader reads as database latency.
+instance_type_loader: 'c5.2xlarge'
+# Four vCPU and 8 GiB for the index node. The vCPU count is the variable under test -- the index
+# node is what serves the containment queries, so cutting it would lower the throughput ceiling this
+# run exists to find. The memory is not: a local measurement put the index at 33 bytes per name and
+# falling with corpus size, so 10M names is a few hundred MB, not the few GB the design assumed.
+# That measurement used a synthetic corpus with only a few dozen distinct characters, and a real
+# name vocabulary makes the term dictionary bigger, so this still leaves several times the headroom.
+# c8g rather than r8g: same Graviton generation and the same vCPU, a quarter of the memory.
+# Raise to m8g.xlarge or r8g.xlarge if a realistic corpus turns out to need it.
+instance_type_vector_store: 'c8g.xlarge'
+
+# Argus: left at its default so the test can report normally if it is ever run from a pipeline.
+# For a local run, turn it off per run instead:
+#   export SCT_ENABLE_ARGUS=false
+# See docs/substring-search-test.md.
+
+# Reach the nodes over their public addresses. Needed because this test case is written to be driven
+# from a developer machine, while SCT's defaults assume the runner sits inside the VPC, as it does
+# under Jenkins. Without this the run provisions fine, the nodes boot fine, and then dies 25 minutes
+# later with "Waiting for SSH to be up: timeout" against a node whose public address accepts the key.
+#
+# Both settings are needed and they are not the same thing. 'ip_ssh_connections' is not what decides
+# the address on the AWS backend: AWSNode.external_address returns
+# scylla_network_configuration.test_communication, which comes from 'scylla_network_config' below,
+# where the AWS default sets it to the private address. The list is given whole because it replaces
+# the default rather than merging with it; only 'test_communication' differs from
+# defaults/aws_config.yaml, since the nodes should still talk to each other privately.
+#
+# The cost of driving from a laptop: the corpus is staged to the loader over the internet rather
+# than within the VPC. For anything beyond a feasibility run, use an SCT cloud runner and drop both.
+ip_ssh_connections: 'public'
+
+scylla_network_config:
+  - address: listen_address
+    listen_all: false
+    ip_type: ipv4
+    public: false
+    use_dns: false
+    nic: 0
+  - address: rpc_address
+    listen_all: false
+    ip_type: ipv4
+    public: false
+    use_dns: false
+    nic: 0
+  - address: broadcast_rpc_address
+    ip_type: ipv4
+    public: false
+    use_dns: false
+    nic: 0
+  - address: broadcast_address
+    ip_type: ipv4
+    public: false
+    use_dns: false
+    nic: 0
+  - address: test_communication   # the one that differs: the runner is outside the VPC
+    ip_type: ipv4
+    public: true
+    use_dns: false
+    nic: 0
+
+# On demand rather than spot. The AWS default is spot, and a run of this shape is long enough to be
+# worth reclaiming: one attempt lost its vector-store node to a SpotTerminationEvent 22 minutes in,
+# in the middle of the source build, which is the most expensive thing the run does. A few dollars
+# of on-demand is cheaper than another provisioning cycle. Drop this line for a run that can afford
+# to be restarted.
+instance_provision: 'on_demand'
+
+user_prefix: 'substring-search'
+
+# Left at its default of false: 'unified_package' installs Scylla onto a stock Ubuntu image rather
+# than booting an image that already has it. Set SCT_USE_PREINSTALLED_SCYLLA=true only when running
+# from a Scylla AMI instead.
+
+# Clean up after ourselves: there is no Jenkins stage behind a local run to destroy the resources,
+# so without this every run leaves its AWS instances up. 'keep-on-failure' rather than 'destroy' so
+# a failed run stays open for inspection -- remember to destroy it by hand afterwards.
+execute_post_behavior: true
+post_behavior_db_nodes: 'keep-on-failure'
+post_behavior_loader_nodes: 'keep-on-failure'
+post_behavior_monitor_nodes: 'keep-on-failure'
+post_behavior_vector_store_nodes: 'keep-on-failure'
+
+# The dataset and query plan. Resolved relative to the SCT root by resolve_test_config_path() in
+# search_perf_test.py, which also accepts a full 's3://bucket/key' URL:
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_build_config.yaml  # time the builds
+search_test_config: 'data_dir/latte/substring_search/aws_config.yaml'
+
+# Passed to every latte invocation, so the index options reach the CREATE statement of the
+# build_index phase as well as the one in 'schema'. 'case_sensitive: false' is what a search box
+# wants and is not the server default; min_gram/max_gram are written out explicitly so that the run
+# records what it measured rather than relying on the defaults staying put.
+latte_schema_parameters:
+  keyspace: 'substring_bench'
+  table: 'users'
+  min_gram: 1
+  max_gram: 3
+  case_sensitive: 'false'

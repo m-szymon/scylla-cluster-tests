@@ -1,0 +1,103 @@
+# Local correctness run of substring_test.SubstringSearchTest.test_substring_search on the docker
+# backend.
+#
+# Purpose: validate the orchestration of the substring test (schema reset, shard staging, index
+# build timing from vector-store's 'full scan' log lines, index size from its gauges, per-query-set
+# search) without provisioning AWS. The numbers it produces are meaningless -- 3000 synthetic names
+# on a containerised Scylla. Use test-cases/substring-search/substring-search-test.yaml for actual
+# performance runs.
+#
+# Prerequisites:
+#   1. Build the two images from the branches, since no released build has the substring index.
+#      ../substring-search-demo/build-images.sh builds exactly these two names:
+#        localhost/scylla-substring:dev
+#        localhost/vector-store-substring:dev
+#   2. Generate the tiny dataset (not tracked in git; a one-off after a fresh clone):
+#        python3 data_dir/latte/substring_search/generate_local_dataset.py
+#
+# Run (see docs/substring-search-test.md):
+#   ./docker/env/hydra.sh run-test substring_test.SubstringSearchTest.test_substring_search \
+#     --backend docker --config test-cases/substring-search/substring-search-test-docker.yaml
+#
+# The images must be in the engine SCT talks to. substring-search-demo/build-images.sh builds them
+# with podman while SCT uses the docker daemon, in which case copy them across:
+#   podman save localhost/scylla-substring:dev       | docker load
+#   podman save localhost/vector-store-substring:dev | docker load
+# What to check afterwards is in docs/substring-search-test.md.
+
+test_metadata:
+  description: >-
+    Local correctness run of the substring search (LIKE '%keyword%') performance test on the docker
+    backend. Loads a tiny synthetic corpus of display names, builds a substring_index against a
+    locally built vector-store image, and runs latte query sets of 1, 2 and 4 character keywords.
+    Validates the test orchestration and the reporting rather than producing meaningful performance
+    numbers.
+  test_type: performance
+  tier: ondemand
+  duration_class: short
+  supported_backends:
+    - docker
+  stress_tools:
+    - latte
+  workload: read
+  nemesis_labels: []
+  features:
+    - tablets
+
+test_duration: 180
+
+# Required: latency_calculator_decorator returns early without it.
+use_hdrhistogram: true
+
+n_db_nodes: 1
+n_loaders: 1
+# No monitoring stack locally: latency_calculator_decorator degrades gracefully without it, so the
+# HDR results (from latte's .hdr files), the reactor stall counters (from the db logs) and the result
+# rows are still collected -- only the Grafana screenshots and the Prometheus based metrics are
+# absent. It also keeps the run from uploading the screenshots to the shared
+# 's3://cloudius-jenkins-test' bucket. Set it to 1 when the dashboards are needed.
+n_monitor_nodes: 0
+n_vector_store_nodes: 1
+
+# Clean up after ourselves. 'execute_post_behavior' defaults to false because in Jenkins a separate
+# pipeline stage destroys the resources -- there is no such stage behind a local run, so without this
+# every run leaves its db and vector-store containers running. 'keep-on-failure' rather than
+# 'destroy' so a failed run stays open for inspection.
+execute_post_behavior: true
+post_behavior_db_nodes: 'keep-on-failure'
+post_behavior_loader_nodes: 'keep-on-failure'
+post_behavior_monitor_nodes: 'keep-on-failure'
+post_behavior_vector_store_nodes: 'keep-on-failure'
+
+# Scylla Manager is rejected outright on the docker backend
+# (sct_config.py:_validate_docker_backend_parameters).
+use_mgmt: false
+
+# On the docker backend `scylla_version` is used as the image tag, so this has to name the image
+# built from the scylladb branch -- a nightly does not have substring_index.
+docker_image: 'localhost/scylla-substring'
+scylla_version: 'dev'
+
+# The docker backend takes a prebuilt image only -- it has no equivalent of the AWS source-build
+# path, so build the fork locally and point at it here. Do NOT set vector_store_source_repo or
+# vector_store_source_ref: they request a source build, which sct_config.py rejects on this backend.
+vector_store_docker_image: 'localhost/vector-store-substring'
+vector_store_version: 'dev'
+
+# Argus: left at its default so the test can report normally if it is ever run from a pipeline.
+# For a local run, turn it off per run instead:
+#   export SCT_ENABLE_ARGUS=false
+# See docs/substring-search-test.md.
+
+user_prefix: 'substring-docker-local'
+
+search_test_config: 'data_dir/latte/substring_search/local_config.yaml'
+
+# Passed to every latte invocation, so the index options reach the CREATE statement of the
+# build_index phase as well as the one in 'schema'.
+latte_schema_parameters:
+  keyspace: 'substring_bench'
+  table: 'users'
+  min_gram: 1
+  max_gram: 3
+  case_sensitive: 'false'

@@ -1,0 +1,72 @@
+# Tiny substring-search plan for local correctness runs.
+#
+# Used by test-cases/substring-search/substring-search-test-docker.yaml. Deliberately small: the
+# goal is to exercise every branch of SubstringSearchTest.test_substring_search, not to produce
+# meaningful performance numbers.
+#
+# Two datasets, one per way of getting the index ready, so a smoke run covers both: 'local_tiny'
+# loads then builds, 'local_ingest' indexes while it loads (the mode the AWS plan uses).
+#
+# No `base_url` -> every shard and query file is read from data_dir/latte/substring_search/<dataset>/
+# and no S3 access happens. The corpora are generated, not tracked in git, so this is a one-off
+# after a fresh clone:
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py --dataset local_ingest
+datasets:
+  - name: local_tiny
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      # Single shard: simplest load path, one rate-limited query.
+      - shards: [0]
+        queries:
+          - set: char2
+            concurrency: 1
+            rate: 50
+      # Shard range: exercises _parse_shard_spec, cumulative name counts and the _drop_index of the
+      # previous step's index.
+      - shards: [1..2]
+        queries:
+          # The hot case: one character carried by a large share of the names, so the index stops
+          # at LIMIT instead of collecting every match.
+          - set: char1
+          - set: char2
+          # Longer than the default max_gram of 3, so the index intersects three-character grams and
+          # verifies each candidate. 'qrels: true' checks the answer is still exactly right.
+          - set: char4
+            qrels: true
+          - set: latin
+          # An answer with no rows in it.
+          - set: miss
+            qrels: true
+      # A rebuild on the same corpus: an empty 'shards' list makes _load_step_shards a no-op, so
+      # this step is only an index build.
+      - shards: []
+
+  # The same corpus again, indexed while it loads rather than built afterwards: the index is
+  # created before the rows are written and the run waits for its document count to reach them.
+  # No build time is reported for this dataset, by design.
+  - name: local_ingest
+    index_during_load: true
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..2]
+        queries:
+          - set: char2
+          # Ground truth over the whole corpus, which this single step has loaded in full, so
+          # recall is meaningful: it says the incremental path indexed everything, not just most.
+          - set: char4
+            qrels: true
+          - set: miss
+            qrels: true

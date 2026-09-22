@@ -1,0 +1,74 @@
+# Substring-search plan for the AWS run: how fast containment queries are at 10M names.
+#
+# Used by test-cases/substring-search/substring-search-test.yaml. The question is query throughput
+# and latency, so the plan is shaped around the query phases and spends as little time as it can on
+# getting the data in:
+#
+#   'index_during_load: true' creates the index before the rows are written, so the index node
+#   ingests through CDC while latte is still loading and no separate full-scan build happens. The
+#   run then waits until the index holds every loaded row and until its segment count stops moving,
+#   and measures nothing about how long that took. Use aws_build_config.yaml for build timing.
+#
+# One step and five query phases: this is a feasibility check, not a test suite. What it answers is
+# whether 10M names can be searched at the target rate within the latency budget, and roughly where
+# the ceiling is. A rate gives latency at a known load; 'rate: 0' pushes until something saturates.
+# Every phase shares 'expected_p99_read_ms', so they all land in one table and read top to bottom.
+#
+# Add rates, sets or duration once the first run says the thing works at all. Deliberately absent:
+# a full rate ladder, the 'latin' set (case folding is cheap and covered by the docker run) and
+# 'miss' (an empty answer is the floor, not the question).
+#
+# Generate the corpus once (about 190 MB, under a minute):
+#
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
+#
+# For a cheaper first pass that exercises the whole pipeline on AWS, generate a smaller corpus into
+# its own directory and point the run at a copy of this file with the dataset name and shard list
+# changed -- 1M names load in a tenth of the time and answer most of the "does it work" questions:
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_1M --names 1000000 --shards 10 --qrels-cap 0
+#
+# Reading the result: if the unthrottled row's throughput is well under the target, suspect the
+# loader before the cluster and raise 'n_loaders'. A rate row whose measured throughput is below
+# the rate it asked for did not keep up, and its latency is a queueing artifact rather than a
+# reading.
+datasets:
+  - name: names_10M
+    index_during_load: true
+    # The budget for the index to catch up with the load and then settle, not for a build.
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    defaults:
+      # The search box shows 20 results per page.
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          # Two characters: the typical search-box query, and the one to judge the design by.
+          # A realistic load first, so there is a latency reading that is not near saturation.
+          - set: char2
+            concurrency: 16
+            rate: 2000
+          # The rate the design was written against.
+          - set: char2
+            concurrency: 64
+            rate: 10000
+          # Unthrottled: where it actually tops out. If this lands near the loader's own limit,
+          # the number is the loader's rather than the cluster's -- raise 'n_loaders' and repeat.
+          - set: char2
+            concurrency: 128
+          # One character: the largest answers, where stopping at LIMIT matters most. One phase,
+          # to see whether the hot case tracks the typical one or falls apart.
+          - set: char1
+            concurrency: 64
+            rate: 10000
+          # Four characters: past max_gram, so gram intersection plus verification of every
+          # candidate. The most expensive shape the index serves, so it bounds the rest.
+          - set: char4
+            concurrency: 64
+            rate: 10000

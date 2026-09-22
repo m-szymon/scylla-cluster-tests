@@ -1,0 +1,76 @@
+# Substring-search plan for the AWS run: the sizing and latency questions the design left open.
+#
+# Used by test-cases/substring-search/substring-search-test.yaml. Two corpus sizes in one run, so
+# that index size and build time can be read as a trend rather than a single number:
+#
+#   step 1   1M names   10 shards
+#   step 2  10M names  100 shards (the other 90 loaded on top)
+#   step 3  10M names  a second build on the same corpus, to see the build-time spread
+#
+# The target the design was written against: 10M names, queries of 1 to 4 characters, p99 under
+# 100 ms. Each step therefore runs the same four query sets -- one rate-limited for a clean latency
+# reading, then unthrottled for throughput.
+#
+# No `base_url`: the corpus is generated on the machine running SCT and staged to the loader, so no
+# S3 bucket is needed. Generate it once (about 250 MB, a few minutes):
+#
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
+#
+# For a smaller first run, generate fewer names into a differently named dataset and point
+# SCT_SEARCH_TEST_CONFIG at a copy of this file with the shard lists trimmed. To pull the corpus
+# from S3 instead, upload the dataset directory and add `base_url: s3://bucket/prefix`.
+datasets:
+  - name: names_10M
+    # A 10M-name build is the thing being measured; give it room before the flow calls it failed.
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 7200
+    defaults:
+      # The search box shows 20 results per page.
+      limit: 20
+      concurrency: 32
+      rate: 0
+      duration: 60s
+      expected_p99_read_ms: 100
+    steps:
+      # ~1M names.
+      - shards: [0..9]
+        queries:
+          # One character: the largest answers, and the case where stopping at LIMIT matters most.
+          - set: char1
+            concurrency: 1
+            rate: 50
+          - set: char1
+          # Two characters: the typical search-box query.
+          - set: char2
+            concurrency: 1
+            rate: 50
+          - set: char2
+          # Four characters: past max_gram, so gram intersection plus verification.
+          - set: char4
+            concurrency: 1
+            rate: 50
+          - set: char4
+          # An empty answer, for the floor of the latency range.
+          - set: miss
+      # ~10M names, the other 90 shards on top.
+      - shards: [10..99]
+        queries:
+          - set: char1
+            concurrency: 1
+            rate: 50
+          - set: char1
+          - set: char2
+            concurrency: 1
+            rate: 50
+          - set: char2
+          - set: char4
+            concurrency: 1
+            rate: 50
+          - set: char4
+          - set: latin
+          - set: miss
+      # A second build on the same 10M names: no load, just how long a rebuild takes and what it
+      # costs in memory. Two readings are not a distribution, but they do show whether the first
+      # build was an outlier.
+      - shards: []
