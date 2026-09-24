@@ -159,3 +159,72 @@ def test_a_missing_gauge_is_no_measurement_rather_than_an_error():
     both look like this -- and neither should end a run that is otherwise fine."""
     assert parse_index_gauge(METRICS_SAMPLE, INDEX_SIZE_METRIC, "substring_bench", "sub_idx_absent") is None
     assert parse_index_gauge("", INDEX_SIZE_METRIC, "substring_bench", "sub_idx_names_10M_0") is None
+
+
+# --- ordering ---------------------------------------------------------------------------------
+
+
+def test_the_ordering_parameters_exist(script_source):
+    """The plan's 'ordered' and 'window' keys become these. A rename makes latte ignore the flag
+    and run the plain query, which still reports a latency -- of the wrong question."""
+    declared = set(RUNE_PARAM_RE.findall(script_source))
+    assert {"order_by", "search_ordered", "search_window_from", "sort_value_count"} <= declared
+
+
+def test_the_script_can_emit_an_order_by_clause(script_source):
+    """Declaring the parameters is not enough; the query has to be built from them."""
+    assert "ORDER BY ${ORDER_BY} DESC" in script_source
+    assert "'order_by': '${ORDER_BY}', " in script_source
+
+
+def test_an_ordered_shape_without_an_ordered_index_is_refused(script_source):
+    """The one failure here that yields a plausible number for the wrong thing: without a sort
+    column the ordered clauses are dropped and the plain query is measured under the ordered row."""
+    assert "search_ordered/search_window_from need an index created with order_by" in script_source
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ({"set": "char2"}, ""),
+        ({"set": "char2", "ordered": True}, " ordered"),
+        ({"set": "char2", "ordered": True, "window": 0.5}, " ordered from 0.5"),
+        ({"set": "char2", "window": 0.5}, " window from 0.5"),
+    ],
+)
+def test_the_shape_is_part_of_the_row_label(query, expected):
+    """Argus keys a cell by (row, column), so a set asked plain and ordered in one step must not
+    share a label -- the two would push conflicting latencies into a single row. The shape belongs
+    in the label rather than a column because it changes what the number means."""
+    assert substring_test.SubstringSearchTest.query_shape_label(None, query) == expected
+
+
+@pytest.mark.parametrize("window", [-0.1, 1.0, 1.5, "half", True])
+def test_a_window_outside_the_order_is_a_plan_error(window):
+    """A fraction at or above 1 bounds the query below every value in the corpus and would measure
+    an empty answer at a plausible-looking latency."""
+    with pytest.raises(ValueError):
+        substring_test._checked_window(window)
+
+
+def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
+    """A plan entry asking for 'ordered' against a test case with no 'order_by' would fail inside
+    the loader, after the corpus is loaded and indexed. Checked here against the tracked pairs."""
+    import yaml
+
+    for case_name, plan_name in (
+        ("substring-search-test-docker.yaml", "local_config.yaml"),
+        ("substring-search-test.yaml", "aws_config.yaml"),
+    ):
+        with open(sct_abs_path(f"test-cases/substring-search/{case_name}"), encoding="utf-8") as f:
+            case = yaml.safe_load(f)
+        with open(sct_abs_path(f"{substring_test.SUBSTRING_BASE_DIR}/{plan_name}"), encoding="utf-8") as f:
+            plan = yaml.safe_load(f)
+        order_by = (case.get("latte_schema_parameters") or {}).get("order_by") or ""
+        asks_for_ordering = any(
+            query.get("ordered") or query.get("window")
+            for dataset in plan["datasets"]
+            for step in dataset.get("steps", [])
+            for query in step.get("queries", [])
+        )
+        assert not asks_for_ordering or order_by, f"{plan_name} asks for ordering, {case_name} sets no order_by"

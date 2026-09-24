@@ -17,7 +17,7 @@ safe and two machines produce the same corpus.
 
 File formats consumed by ``substring.rn``:
 
-* ``shards/names_NNN.tsv`` -- ``user_id<TAB>nickname``
+* ``shards/names_NNN.tsv`` -- ``user_id<TAB>nickname<TAB>register_time``
 * ``names.tsv``            -- same, for the non-sharded path
 * ``queries_<set>.tsv``    -- ``query_id<TAB>keyword`` (a bare keyword; the script wraps it in %%)
 * ``qrels_<set>.tsv``      -- ``query_id<TAB>user_id<TAB>grade``, grade 1 for every row that
@@ -35,6 +35,24 @@ query sets below are chosen by measured frequency rather than by hand:
             three-character grams and verifies each candidate against the stored name.
 ``latin``   Latin substrings, which a case-insensitive index has to fold on both sides.
 ``miss``    keywords no name contains: the cost of an empty answer.
+
+The third column is the value an ordered index sorts by -- ``register_time``, as a bigint, since
+that is what the customer orders on. Its *distribution against insertion order* is the thing to
+vary, because it decides whether the index's segments end up narrow enough to prune:
+
+``--sort-order sequential``
+    the account registered earliest is written first, as a real backfill of an accounts table
+    would be. Each segment then holds one contiguous slice of the range and an ordered query can
+    skip whole segments on their bounds. The favourable case.
+
+``--sort-order shuffled``
+    the same values in a random order, which is what a backfill by partition key, or a restore,
+    produces. Every segment spans nearly the whole range, nothing prunes, and an ordered query
+    walks every match. The adverse case, and the one the design note calls out as the open risk.
+
+The value is the row's position in the corpus either way, so the two orders index exactly the same
+set of values and differ only in which rows carry which -- the comparison is about layout, not about
+data.
 
 Ground truth (``qrels_*.tsv``) is written only for query sets whose every keyword matches at most
 ``--qrels-cap`` names, since recall against a limit of 20 is meaningless once the answer is larger
@@ -93,9 +111,20 @@ def _make_name(rng: random.Random) -> str:
     return name[:MAX_NAME_CHARS]
 
 
-def _generate_names(count: int, seed: int) -> list[tuple[str, str]]:
+def _generate_names(count: int, seed: int, sort_order: str) -> list[tuple[str, str, int]]:
+    """The corpus, in the order it is written: id, name, and the value an ordered index sorts by.
+
+    The sort values are always 0..count-1, so both orders index the same values; `shuffled` only
+    changes which row carries which, and so how wide a segment's span of them ends up.
+    """
     rng = random.Random(seed)
-    return [(f"u{i:09d}", _make_name(rng)) for i in range(count)]
+    rows = [(f"u{i:09d}", _make_name(rng)) for i in range(count)]
+    sort_values = list(range(count))
+    if sort_order == "shuffled":
+        # Its own generator, so that a corpus's names do not change when its sort order does: the
+        # two orders must differ in nothing but the column being compared.
+        random.Random(seed ^ 0x5F5F).shuffle(sort_values)
+    return [(user_id, name, sort_value) for (user_id, name), sort_value in zip(rows, sort_values)]
 
 
 def _write_tsv(path: str, rows) -> None:
@@ -105,10 +134,10 @@ def _write_tsv(path: str, rows) -> None:
             out.write("\t".join(str(field) for field in row) + "\n")
 
 
-def _substring_counts(names: list[tuple[str, str]], length: int, sample: int) -> Counter:
+def _substring_counts(names: list[tuple[str, str, int]], length: int, sample: int) -> Counter:
     """How many of the (sampled) names contain each substring of the given length."""
     counts: Counter = Counter()
-    for _, name in names[:sample]:
+    for _, name, _sort_value in names[:sample]:
         seen = {name[i : i + length] for i in range(len(name) - length + 1)}
         counts.update(seen)
     return counts
@@ -125,11 +154,11 @@ def _latin_keywords(counts: Counter, wanted: int) -> list[str]:
     return picked[:wanted]
 
 
-def _exact_matches(names: list[tuple[str, str]], keyword: str, cap: int) -> list[str] | None:
+def _exact_matches(names: list[tuple[str, str, int]], keyword: str, cap: int) -> list[str] | None:
     """Every id whose name contains the keyword, or None once there are more than `cap` of them."""
     folded = keyword.lower()
     hits = []
-    for user_id, name in names:
+    for user_id, name, _sort_value in names:
         if folded in name.lower():
             hits.append(user_id)
             if len(hits) > cap:
@@ -137,10 +166,12 @@ def _exact_matches(names: list[tuple[str, str]], keyword: str, cap: int) -> list
     return hits
 
 
-def generate(dataset: str, names_count: int, shards: int, out_root: str, seed: int, qrels_cap: int) -> None:
+def generate(
+    dataset: str, names_count: int, shards: int, out_root: str, seed: int, qrels_cap: int, sort_order: str
+) -> None:
     ds_dir = os.path.join(out_root, dataset)
-    print(f"generating {names_count} names into {ds_dir} ({shards} shard(s))")
-    names = _generate_names(names_count, seed)
+    print(f"generating {names_count} names into {ds_dir} ({shards} shard(s)), sort order {sort_order}")
+    names = _generate_names(names_count, seed, sort_order)
 
     if shards > 1:
         per_shard = (names_count + shards - 1) // shards
@@ -216,8 +247,15 @@ def main() -> None:
         default=50,
         help="skip ground truth for a query set whose keyword matches more names than this; 0 disables it (default: 50)",
     )
+    parser.add_argument(
+        "--sort-order",
+        choices=("sequential", "shuffled"),
+        default="sequential",
+        help="how the ordered column's values run against insertion order; 'shuffled' is the adverse "
+        "case for segment pruning (default: sequential)",
+    )
     args = parser.parse_args()
-    generate(args.dataset, args.names, args.shards, args.out, args.seed, args.qrels_cap)
+    generate(args.dataset, args.names, args.shards, args.out, args.seed, args.qrels_cap, args.sort_order)
 
 
 if __name__ == "__main__":

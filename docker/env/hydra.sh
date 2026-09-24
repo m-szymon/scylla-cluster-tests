@@ -201,7 +201,13 @@ JENKINS_OPTIONS=$(env | sed -n 's/^\(JENKINS_[^=]*\)=.*/--env \1/p')
 
 
 is_podman="$($tool --help | { grep -o podman || :; })"
-docker_common_args=()
+docker_common_args=(
+    # The image pins every Python dependency SCT needs, and the run mounts the caller's home
+    # directory, which puts ~/.local/lib/pythonX.Y/site-packages ahead of them on sys.path. A
+    # host package of the same name as a pinned one then shadows it, and hydra dies on an import
+    # error from inside the image -- a machine-specific failure that looks like a broken checkout.
+    -e PYTHONNOUSERSITE=1
+)
 
 function EPHEMERAL_PORT() {
     LOW_BOUND=49152

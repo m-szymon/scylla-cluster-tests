@@ -18,10 +18,15 @@
 # a full rate ladder, the 'latin' set (case folding is cheap and covered by the docker run) and
 # 'miss' (an empty answer is the floor, not the question).
 #
-# Generate the corpus once (about 190 MB, under a minute):
+# Generate the two corpora once (about 190 MB each, under a minute each). They hold the same names
+# and the same sort values and differ only in which row carries which, so the second measures what
+# arrival order alone costs:
 #
 #   python3 data_dir/latte/substring_search/generate_local_dataset.py \
 #       --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_10M_shuffled --names 10000000 --shards 100 --qrels-cap 0 \
+#       --sort-order shuffled
 #
 # For a cheaper first pass that exercises the whole pipeline on AWS, generate a smaller corpus into
 # its own directory and point the run at a copy of this file with the dataset name and shard list
@@ -70,5 +75,78 @@ datasets:
           # Four characters: past max_gram, so gram intersection plus verification of every
           # candidate. The most expensive shape the index serves, so it bounds the rest.
           - set: char4
+            concurrency: 64
+            rate: 10000
+
+          # --- ordering ------------------------------------------------------------------------
+          # The customer's actual query. Ordering removes the early stop that makes the plain
+          # query fast: instead of taking the first 20 matches the index has to find the 20
+          # highest, which costs either a walk of every match or a prune of the segments that
+          # cannot hold one. Same set, same rate as the plain row above, so the two are directly
+          # comparable and the difference is the price of ORDER BY.
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          # Unthrottled, to see where ordering tops out against the plain ceiling.
+          - set: char2
+            ordered: true
+            concurrency: 128
+          # A later page: the query a cursor halfway down the order produces. Paging is the whole
+          # reason the cursor exists, and the claim is that page 50 costs what page 1 costs -- so
+          # this row should match the ordered row above. If it is slower, the cursor is not doing
+          # its job.
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          # The hot case, ordered: the largest answers are where a walk of every match hurts most,
+          # so this is where pruning either shows or does not.
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000
+
+  # The same corpus, written in an order that leaves the index no usable segment bounds.
+  #
+  # This is the open risk of the ordering design, measured rather than argued. The index prunes a
+  # segment by the range of sort values it holds, and a segment holds whatever arrived together:
+  # load the accounts oldest first and each segment is one contiguous slice of the range, so most
+  # segments cannot hold a top-20 row and are never opened. Load them in a shuffled order -- which
+  # is what a backfill by partition key, or a restore, produces -- and every segment spans nearly
+  # the whole range, nothing prunes, and an ordered query walks every match.
+  #
+  # Only the ordered rows are repeated: the plain query does not read the sort column and cannot
+  # care. If these rows match the ones above, pruning is not what is carrying the ordered query and
+  # the segment work is less urgent than the design note assumes. If they are far worse, the gap is
+  # the size of the problem P3 has to solve.
+  - name: names_10M_shuffled
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            ordered: true
+            concurrency: 128
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          - set: char1
+            ordered: true
             concurrency: 64
             rate: 10000

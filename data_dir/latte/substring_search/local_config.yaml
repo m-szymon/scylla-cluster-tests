@@ -12,6 +12,8 @@
 # after a fresh clone:
 #   python3 data_dir/latte/substring_search/generate_local_dataset.py
 #   python3 data_dir/latte/substring_search/generate_local_dataset.py --dataset local_ingest
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py --dataset local_shuffled \
+#       --sort-order shuffled
 datasets:
   - name: local_tiny
     max_index_wait_secs: 300
@@ -70,3 +72,40 @@ datasets:
             qrels: true
           - set: miss
             qrels: true
+          # The three shapes of the same set, so the smoke run covers each once. They are separate
+          # rows rather than one: an ordered answer and a plain one are different questions.
+          - set: char2
+            ordered: true
+          # A later page, expressed as the query a cursor halfway down the order would produce.
+          # No qrels: ground truth covers the whole corpus and cannot describe a windowed answer.
+          - set: char2
+            ordered: true
+            window: 0.5
+          # A window with no ORDER BY: the range is pushed down either way, which is worth covering
+          # because it is a different restriction path from the ordered one.
+          - set: char2
+            window: 0.5
+
+  # The same corpus and the same sort values, written in a different order. Sequential arrival lets
+  # each index segment hold one contiguous slice of the range, so an ordered query skips whole
+  # segments on their bounds; shuffled arrival leaves every segment spanning everything, nothing
+  # prunes, and the walk visits every match. Locally this measures nothing -- 3000 names fit in one
+  # segment -- and is here so the plan shape and the generator flag are exercised. The comparison
+  # is meant for the AWS plan.
+  - name: local_shuffled
+    index_during_load: true
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..2]
+        queries:
+          - set: char2
+            ordered: true
+          - set: char2
+            ordered: true
+            window: 0.5

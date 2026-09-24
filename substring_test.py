@@ -50,6 +50,19 @@ from sdcm.utils.vector_store_index import index_build_columns
 
 SUBSTRING_BASE_DIR = "data_dir/latte/substring_search"
 
+
+def _checked_window(value) -> float:
+    """Validate a plan's 'window': where in the order a windowed query starts, as a fraction.
+
+    0 is 'no window' (the first page). Anything at or above 1 would bound the query below every
+    value in the corpus and measure an empty answer, so it is a plan bug rather than an extreme.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Invalid query window {value!r}: expected a number in [0, 1)")
+    if not 0.0 <= float(value) < 1.0:
+        raise ValueError(f"Invalid query window {value!r}: expected a fraction in [0, 1)")
+    return float(value)
+
 # The column of the index build table counting what was indexed. Named once: it goes both into the
 # table definition and into every row submitted, and Argus keys the table's history by it.
 SUBSTRING_BUILD_COUNT_COLUMN = "name_count"
@@ -165,6 +178,47 @@ class SubstringSearchTest(SearchPerformanceTest):
     """
 
     WORKLOAD = SUBSTRING_WORKLOAD
+
+    def query_shape_label(self, query: dict) -> str:
+        """Name the shape an ordered plan asks a query set in.
+
+        A set run plain, ordered and windowed produces three rows whose latencies are not comparable
+        configurations of one measurement but answers to three different questions, so the shape
+        goes in the row label rather than in a column.
+        """
+        ordered = bool(query.get("ordered", False))
+        window = _checked_window(query.get("window", 0.0))
+        if window > 0.0:
+            return f" ordered from {window:g}" if ordered else f" window from {window:g}"
+        return " ordered" if ordered else ""
+
+    def extra_search_params(self, query: dict, record_count: int) -> str:
+        """Translate the plan's 'ordered' and 'window' keys into substring.rn's '-P' flags.
+
+        'window: 0.5' asks for the page that begins halfway down the order, which is how a later
+        page is measured: latte drives no CQL paging, but a page resuming at a cursor is exactly a
+        query bounded by it, and keeping that flat is what the cursor is for.
+        """
+        ordered = bool(query.get("ordered", False))
+        window = _checked_window(query.get("window", 0.0))
+        if not ordered and window <= 0.0:
+            return ""
+        if not self._order_by:
+            # Nothing downstream would fail: the index has no sort column, so substring.rn refuses
+            # the shape -- but it refuses inside the loader, after the corpus is loaded and indexed.
+            raise ValueError(
+                f"Query set {query.get('set')!r} asks for an ordered or windowed search, but "
+                f"'latte_schema_parameters' sets no 'order_by', so the index has nothing to order by"
+            )
+        params = f"-P search_ordered={'true' if ordered else 'false'} "
+        if window > 0.0:
+            params += f"-P search_window_from={window} -P sort_value_count={record_count} "
+        return params
+
+    @property
+    def _order_by(self) -> str:
+        """The column the index orders by, from the test case, or "" when it has none."""
+        return (self.params.get("latte_schema_parameters") or {}).get("order_by") or ""
 
     # Set per dataset from the plan's 'index_during_load'; see _run_dataset.
     _index_during_load = False

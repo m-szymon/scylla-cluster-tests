@@ -434,7 +434,13 @@ _QUERY_PARAM_NAMES = ("limit", "concurrency", "rate")
 
 
 def row_labels_for_step(
-    workload: SearchWorkload, queries: list, dataset_name: str, defaults: dict, record_count: int, step_number: int
+    workload: SearchWorkload,
+    queries: list,
+    dataset_name: str,
+    defaults: dict,
+    record_count: int,
+    step_number: int,
+    shape_labels: list[str] | None = None,
 ) -> list[str]:
     """Build the Argus row label for every query in a step, disambiguating collisions.
 
@@ -450,6 +456,11 @@ def row_labels_for_step(
     its query rows would land on the predecessor's. It also lets a query row be lined up with the
     build row it ran against.
 
+    ``shape_labels`` distinguishes query entries that name the same set but ask a differently
+    *shaped* question of it -- the substring test runs one set plain, ordered and windowed. The
+    shape belongs in the label rather than in a column because it decides what the latency means:
+    an ordered row and a plain row are not two configurations of one measurement.
+
     That leaves only collisions *within* a step, resolved in two cases:
 
     1. A label that does not collide is returned unchanged.
@@ -464,9 +475,10 @@ def row_labels_for_step(
     reordering never renames anything and adding an entry only affects rows sharing its label. Only
     ``run #N`` is positional, and by then the entries are interchangeable by construction.
     """
+    shapes = shape_labels if shape_labels is not None else [""] * len(queries)
     labels = [
-        f"{dataset_name} | {record_count:,} {workload.item_noun} | step #{step_number} | {query['set']}"
-        for query in queries
+        f"{dataset_name} | {record_count:,} {workload.item_noun} | step #{step_number} | {query['set']}{shape}"
+        for query, shape in zip(queries, shapes)
     ]
     params = [_query_params(query, defaults) for query in queries]
     label_keys = [
@@ -717,6 +729,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         expected_p99_read_ms,
         query_example,
         qrels_file=None,
+        extra_params="",
     ):
         """Run a single search configuration with latency collection.
 
@@ -774,6 +787,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                     f"{qrels_param}"
                     f"-P {params.compute_accuracy}={'true' if qrels_file else 'false'} "
                     f"-P {params.search_limit}={limit} "
+                    f"{extra_params}"
                     f"{rate_param}--concurrency={concurrency} --retry-number 1 "
                 ),
                 files_to_stage=files_to_stage,
@@ -822,6 +836,12 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         if duplicates := sorted({name for name in names if names.count(name) > 1}):
             raise ValueError(f"Duplicate dataset names in '{config_name}': {duplicates}")
         validate_plan_queries(datasets)
+        # The workload's own query keys, checked here for the same reason the shared ones are: a
+        # typo should cost a second, not the half hour it takes to load and index a corpus.
+        for dataset in datasets:
+            for step in dataset.get("steps", []):
+                for query in step.get("queries", []):
+                    self.extra_search_params(query, 0)
 
         for dataset in datasets:
             self._run_dataset(dataset)
@@ -892,12 +912,32 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         if index_name is not None:
             self._drop_index(index_name, keyspace, max_index_wait)
 
+    def query_shape_label(self, query: dict) -> str:
+        """A short suffix naming what shape of question a query entry asks, or "" for the only one.
+
+        Overridden by a workload whose plan can ask one query set in more than one way; the base
+        flow has a single shape, so nothing distinguishes two entries but their configuration.
+        """
+        return ""
+
+    def extra_search_params(self, query: dict, record_count: int) -> str:
+        """Workload-specific '-P name=value ' flags for a query entry, or "".
+
+        Must end with a trailing space when non-empty: it is concatenated into the latte command.
+        Called during plan validation too, with a record count of 0, so it is also where a
+        workload rejects a query key it cannot honour.
+        """
+        return ""
+
     def _run_step_queries(self, step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir):
         """Run every query set of a step against the index that was just built."""
         queries = step.get("queries", [])
         # NOTE: row labels are resolved for the whole step up front so that repeated query configs
         #       can be told apart -- see row_labels_for_step().
-        row_labels = row_labels_for_step(self.WORKLOAD, queries, dataset_name, defaults, record_count, step_number)
+        shape_labels = [self.query_shape_label(query) for query in queries]
+        row_labels = row_labels_for_step(
+            self.WORKLOAD, queries, dataset_name, defaults, record_count, step_number, shape_labels
+        )
 
         for query, row_label in zip(queries, row_labels):
             qset = _checked_name(query["set"], "query set name")
@@ -929,6 +969,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                 expected_p99_read_ms=expected_p99_read_ms,
                 query_example=_first_query_example(local_ds_dir, queries_file),
                 qrels_file=qrels_file,
+                extra_params=self.extra_search_params(query, record_count),
             )
 
     def _download_dataset_files(self, bucket, prefix, local_dir, dataset):

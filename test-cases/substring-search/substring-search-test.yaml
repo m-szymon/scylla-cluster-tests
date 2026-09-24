@@ -182,3 +182,8 @@ latte_schema_parameters:
   min_gram: 1
   max_gram: 3
   case_sensitive: 'false'
+  # The column the index keeps its matches sorted by. Setting it gives the table a 'register_time'
+  # bigint carrying the third field of the names file, and creates the index to order by it, which
+  # is what lets a plan ask a query set with 'ordered' or 'window'. Remove it to run the stage-1
+  # shape, in which case no query entry may ask for either.
+  order_by: 'register_time'

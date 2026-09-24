@@ -8,6 +8,13 @@
 //!   substring.rn   CREATE CUSTOM INDEX ... USING 'substring_index'
 //!                  SELECT ... WHERE col LIKE :pattern LIMIT n
 //!
+//! An index created with an 'order_by' column answers in that column's order and takes a range on
+//! it, so the search phase has three shapes rather than one (see SEARCH_ORDERED/SEARCH_WINDOW_FROM):
+//!
+//!   plain      WHERE col LIKE :pattern LIMIT n
+//!   ordered    WHERE col LIKE :pattern ORDER BY sort DESC LIMIT n
+//!   windowed   WHERE col LIKE :pattern AND sort < :cursor ORDER BY sort DESC LIMIT n
+//!
 //! The LIKE pattern is '%keyword%': the queries file holds bare keywords and this script wraps
 //! them, so that a plan can reuse one keyword file at several `search_limit` values. The pattern is
 //! bound rather than interpolated, which is also the path a real application takes.
@@ -54,6 +61,26 @@ const NAME_COUNT = latte::param!("name_count", 0);
 const MIN_GRAM = latte::param!("min_gram", 0);
 const MAX_GRAM = latte::param!("max_gram", 0);
 const CASE_SENSITIVE = latte::param!("case_sensitive", true);
+//   order_by   the column the index keeps its matches sorted by. Empty (the default) leaves the
+//              option out, and the table has no such column at all, which is the stage-1 shape.
+//              Set it and the table gains a bigint column of that name, carrying the third field
+//              of the names file, and the index is created to order by it.
+const ORDER_BY = latte::param!("order_by", "");
+
+// Search shape. Both are meaningless without ORDER_BY and are rejected below rather than silently
+// ignored, since a run that measured the unordered query while its report said 'ordered' would be
+// worse than one that failed.
+//   search_ordered      add 'ORDER BY <order_by> DESC'.
+//   search_window_from  add 'AND <order_by> < :cursor', with the cursor this far into the value
+//                       range: 0.0 leaves the window out, 0.5 starts halfway down. This is how a
+//                       later page is measured. latte drives no CQL paging, but a page that
+//                       resumes at a cursor is exactly a query bounded by it, which is the cost
+//                       the cursor was introduced to keep flat.
+const SEARCH_ORDERED = latte::param!("search_ordered", false);
+const SEARCH_WINDOW_FROM = latte::param!("search_window_from", 0.0);
+// The number of distinct sort values, needed to turn 'search_window_from' into a bound. The
+// generator numbers them 0..name_count-1, so this is the corpus size.
+const SORT_VALUE_COUNT = latte::param!("sort_value_count", 0);
 
 // Dataset files
 const SUBSTRING_DATA_DIR = latte::param!("substring_data_dir", "./");
@@ -89,8 +116,23 @@ fn index_options_clause() {
     let opts = "";
     if MIN_GRAM > 0 { opts += `'min_gram': '${MIN_GRAM}', `; }
     if MAX_GRAM > 0 { opts += `'max_gram': '${MAX_GRAM}', `; }
+    if is_ordered() { opts += `'order_by': '${ORDER_BY}', `; }
     opts += `'case_sensitive': '${CASE_SENSITIVE}'`;
     ` WITH OPTIONS = {${opts}}`
+}
+
+/// Whether this run indexes with an ordered column.
+fn is_ordered() {
+    ORDER_BY != ""
+}
+
+/// The column list of the table, which gains the sort column only when there is one to gain.
+fn table_columns() {
+    if is_ordered() {
+        `user_id text PRIMARY KEY, ${TARGET_COLUMN} text, ${ORDER_BY} bigint`
+    } else {
+        `user_id text PRIMARY KEY, ${TARGET_COLUMN} text`
+    }
 }
 
 /// Create the substring index if absent. Idempotent (IF NOT EXISTS), called from `schema`,
@@ -108,7 +150,7 @@ pub async fn schema(db) {
 
     db.execute(`CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH REPLICATION = \
         {'class': 'NetworkTopologyStrategy', 'replication_factor': '${REPLICATION_FACTOR}'}`).await?;
-    db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (user_id text PRIMARY KEY, ${TARGET_COLUMN} text)`).await?;
+    db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (${table_columns()})`).await?;
 
     if DROP_INDEX {
         db.execute(`DROP INDEX IF EXISTS ${KEYSPACE}.${INDEX_NAME}`).await?;
@@ -166,7 +208,7 @@ pub async fn prepare(db) {
     if has_load {
         db.execute(`CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH REPLICATION = \
             {'class': 'NetworkTopologyStrategy', 'replication_factor': '${REPLICATION_FACTOR}'}`).await?;
-        db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (user_id text PRIMARY KEY, ${TARGET_COLUMN} text)`).await?;
+        db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (${table_columns()})`).await?;
         if WITH_INDEX {
             create_index(db).await?;
         }
@@ -177,12 +219,27 @@ pub async fn prepare(db) {
         while let Some(entry) = it.next() {
             let raw = entry?;
             if !raw.is_empty() {
-                db.data.names.push(#{ "id": raw[0], "name": raw[1] });
+                // The third field is the ordered column's value. A corpus generated before that
+                // column existed has only two, so an ordered run against one has to fail here
+                // rather than insert nulls -- rows with no sort value are simply missing from an
+                // ordered answer, which looks like a recall bug in the index.
+                if is_ordered() {
+                    if raw.len() < 3 {
+                        return Err(`names file ${path} has no sort value column, but order_by=${ORDER_BY} was set; regenerate the corpus with generate_local_dataset.py`);
+                    }
+                    db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": raw[2].parse::<i64>()? });
+                } else {
+                    db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": 0 });
+                }
             }
         }
         db.load_cycle_count = db.data.names.len();
         println!("Loaded {} names from {}", db.data.names.len(), path);
-        db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (user_id, ${TARGET_COLUMN}) VALUES (:user_id, :name)`).await?;
+        if is_ordered() {
+            db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (user_id, ${TARGET_COLUMN}, ${ORDER_BY}) VALUES (:user_id, :name, :sort)`).await?;
+        } else {
+            db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (user_id, ${TARGET_COLUMN}) VALUES (:user_id, :name)`).await?;
+        }
     }
 
     if has_build_index {
@@ -242,11 +299,37 @@ pub async fn prepare(db) {
 
         println!("Search limit: {}", SEARCH_LIMIT);
 
-        db.prepare(SEARCH, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern LIMIT ${SEARCH_LIMIT}`).await?;
+        // An ordered or windowed shape without a column to order by would quietly run the plain
+        // query and report it under the ordered row, which is the one failure here that produces a
+        // plausible number for the wrong thing.
+        if (SEARCH_ORDERED || SEARCH_WINDOW_FROM > 0.0) && !is_ordered() {
+            return Err("search_ordered/search_window_from need an index created with order_by");
+        }
+        if SEARCH_WINDOW_FROM > 0.0 && SORT_VALUE_COUNT <= 0 {
+            return Err("search_window_from needs sort_value_count, the number of distinct sort values");
+        }
+
+        // The window bound. The generator numbers the sort values 0..count-1 and an ordered walk
+        // runs downwards, so a cursor at fraction f of the way down is (1 - f) * count: f = 0.5
+        // asks for the page that begins halfway through the order.
+        db.data.window_cursor = 0;
+        let window_clause = "";
+        if SEARCH_WINDOW_FROM > 0.0 {
+            db.data.window_cursor = ((1.0 - SEARCH_WINDOW_FROM) * SORT_VALUE_COUNT as f64) as i64;
+            window_clause = ` AND ${ORDER_BY} < :cursor`;
+            println!("Window: {} < {}", ORDER_BY, db.data.window_cursor);
+        }
+        let order_clause = "";
+        if SEARCH_ORDERED {
+            order_clause = ` ORDER BY ${ORDER_BY} DESC`;
+        }
+        db.prepare(SEARCH, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern${window_clause}${order_clause} LIMIT ${SEARCH_LIMIT}`).await?;
 
         db.set_report_field("dataset", SUBSTRING_DATA_DIR);
         db.set_report_field("queries_file", QUERIES_FILE);
         db.set_report_field("compute_accuracy", `${COMPUTE_ACCURACY}`);
+        db.set_report_field("search_ordered", `${SEARCH_ORDERED}`);
+        db.set_report_field("search_window_from", `${SEARCH_WINDOW_FROM}`);
 
         db.declare_metric("result_count", "higher");
 
@@ -259,7 +342,11 @@ pub async fn prepare(db) {
 
 pub async fn load(db, i) {
     let row = db.data.names[i % db.data.names.len()];
-    db.execute_prepared(INSERT, #{ "user_id": row.id, "name": row.name }).await?;
+    if is_ordered() {
+        db.execute_prepared(INSERT, #{ "user_id": row.id, "name": row.name, "sort": row.sort }).await?;
+    } else {
+        db.execute_prepared(INSERT, #{ "user_id": row.id, "name": row.name }).await?;
+    }
 }
 
 pub async fn build_index(db, i) {
@@ -319,7 +406,12 @@ pub async fn search(db, i) {
     let idx = latte::hash(i) % db.data.queries.len();
     let query = db.data.queries[idx];
 
-    match db.execute_prepared_with_result(SEARCH, #{ "pattern": contains_pattern(query.text) }).await {
+    let args = #{ "pattern": contains_pattern(query.text) };
+    if SEARCH_WINDOW_FROM > 0.0 {
+        args.cursor = db.data.window_cursor;
+    }
+
+    match db.execute_prepared_with_result(SEARCH, args).await {
         Err(e) => {
             if !db.data.failed_bitmap[idx] {
                 println!("WARNING: query failed [idx={} id=\"{}\" keyword=\"{}\" error={}]",
@@ -335,6 +427,10 @@ pub async fn search(db, i) {
             }
             db.record_metric("result_count", returned_ids.len() as f64);
 
+            // NOTE: ground truth covers the whole corpus, so it cannot describe a windowed
+            //       answer -- the rows below the cursor are correctly absent but count as misses.
+            //       A plan that puts 'qrels: true' on a windowed set is asking recall a question it
+            //       cannot answer; precision still means what it always did.
             if COMPUTE_ACCURACY {
                 let relevant_ids = [];
                 for qrel in db.data.qrels_by_query[idx] {

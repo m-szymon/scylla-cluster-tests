@@ -11,6 +11,8 @@ It exists to answer the questions the feature design left open:
 | Do containment queries meet p99 < 100 ms at 10M names, and at what throughput? | one latency table per `expected_p99_read_ms` in the plan, one row per query configuration |
 | How much memory does the index cost per indexed name? | **Substring Index Size**: bytes, bytes per name and segment count |
 | How long does the index take to build, and at what rate? | **Substring Index Build Time**, from the build-oriented plan only |
+| What does `ORDER BY` cost, and does a later page cost more than the first? | the ordered and windowed rows of the latency table, next to the plain ones |
+| Does that depend on the order the rows arrived in? | the `names_10M_shuffled` dataset, same corpus, adverse arrival order |
 
 The default plan answers the first two and deliberately does not measure the third: it indexes while
 it loads, so there is no separate build to time. See *Indexing during the load* below.
@@ -61,6 +63,67 @@ settling from a bulk load.
 Query keywords come from the dataset's `queries_<set>.tsv` as bare words; the rune script wraps each
 one into `'%keyword%'` and binds it. Nothing in the query path uses `ALLOW FILTERING`, which is the
 whole point: a run that accidentally scanned would report plausible latencies for the wrong thing.
+
+## Ordering, and the shape of a query set
+
+An index created with an `order_by` column answers newest-first and takes a range on that column, so
+a query set can be asked in three shapes. The shape is a property of the query entry:
+
+```yaml
+- set: char2                    # plain:    WHERE nickname LIKE ? LIMIT 20
+- set: char2
+  ordered: true                 # ordered:  ... ORDER BY register_time DESC LIMIT 20
+- set: char2
+  ordered: true
+  window: 0.5                   # windowed: ... AND register_time < ? ORDER BY ... LIMIT 20
+```
+
+The shape goes into the Argus **row label**, not into a column, because it changes what the latency
+means: an ordered row and a plain row are answers to two different questions rather than two
+configurations of one measurement. Two entries naming one set in one step would otherwise collide
+on the label and push conflicting numbers into a single row.
+
+`ordered` and `window` need `order_by: 'register_time'` in the test case's
+`latte_schema_parameters`, which is what gives the table its sort column and the index its option.
+A plan asking for either without it is rejected before the run loads anything.
+
+### Why `window` stands in for paging
+
+The point of the cursor the feature introduced is that page 50 costs what page 1 costs: a later page
+resumes the index's walk instead of restarting it and skipping. latte drives no CQL paging, so the
+benchmark cannot ask for page 50 directly -- but a page that resumes at a cursor *is* a query
+bounded by that cursor, which is exactly what `window: 0.5` sends. A windowed row far slower than
+the ordered row next to it is the cursor failing to do its job.
+
+`window` is a fraction of the way down the order, so `0.5` starts halfway. Ground truth cannot
+describe a windowed answer -- it covers the whole corpus, and the rows below the cursor are
+correctly absent but count as misses -- so do not put `qrels: true` on a windowed entry.
+
+### Arrival order is the variable that matters
+
+The index prunes a segment by the span of sort values it holds, and a segment holds whatever arrived
+together. Load the accounts oldest first and each segment is one contiguous slice of the range, so
+most segments cannot hold a top-20 row and are never opened. Load them shuffled -- what a backfill
+by partition key, or a restore, produces -- and every segment spans nearly the whole range, nothing
+prunes, and an ordered query walks every match.
+
+That is the open risk of the ordering design, so the plan measures it rather than arguing it. The
+corpus generator takes `--sort-order sequential|shuffled`; both write the same names and the same
+set of sort values and differ only in which row carries which, so the comparison is about layout
+alone:
+
+```sh
+python3 data_dir/latte/substring_search/generate_local_dataset.py \
+    --dataset names_10M_shuffled --names 10000000 --shards 100 --qrels-cap 0 --sort-order shuffled
+```
+
+`aws_config.yaml` runs the ordered rows twice, once per corpus. If the two agree, pruning is not
+what carries the ordered query and the segment work P3 plans is less urgent than the design note
+assumes. If the shuffled rows are far worse, the gap is the size of the problem.
+
+The corpus now carries a third column (`user_id<TAB>nickname<TAB>register_time`), so a corpus
+generated before this existed has to be regenerated before an ordered run. The rune script says so
+rather than inserting nulls, which would look like a recall bug in the index.
 
 ## Running it from a developer machine against AWS
 
@@ -232,6 +295,7 @@ latte_schema_parameters:
   min_gram: 1
   max_gram: 3
   case_sensitive: 'false'
+  order_by: 'register_time'
 ```
 
 `max_gram` is the knob that trades index size for the cost of long keywords: at 3, a keyword of four
@@ -318,10 +382,11 @@ SSH, not into indexing. The two-hour ingestion budget in the plan is deliberatel
 
 ## What this test does not cover
 
-* **Ordering and paging.** The feature's first stage returns rows in the index's order and takes no
-  `ORDER BY`, so the benchmark does not ask for one. The customer's real query orders by
-  `register_time DESC` and pages 20 at a time; when that lands, it belongs in the plan as another
-  query set.
+* **Real CQL paging.** Ordering and a later page are measured (see *Ordering* above), but through a
+  range bound rather than by paging a result set, because latte drives no paging. What that does not
+  cover is the paging state itself: the cursor's round trip through `paging_state`, and whether the
+  pages of one query are disjoint and cover everything. That is checked in the ScyllaDB tree
+  instead.
 * **Mixed workloads.** Names are loaded, then queried. Nothing updates a name while the queries run,
   so the index's write path is measured only as build throughput.
 * **More than one index.** Real use indexes both a nickname and a username column and merges the two
