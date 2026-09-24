@@ -20,7 +20,9 @@
 #
 # Generate the two corpora once (about 190 MB each, under a minute each). They hold the same names
 # and the same sort values and differ only in which row carries which, so the second measures what
-# arrival order alone costs:
+# arrival order alone costs. A names_10M left over from a stage-1 run has no sort column and must be
+# regenerated -- the rune script refuses an ordered load against it -- and regenerating with the
+# default seed reproduces its names exactly, so stage-1 results stay a valid baseline:
 #
 #   python3 data_dir/latte/substring_search/generate_local_dataset.py \
 #       --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
@@ -82,8 +84,14 @@ datasets:
           # The customer's actual query. Ordering removes the early stop that makes the plain
           # query fast: instead of taking the first 20 matches the index has to find the 20
           # highest, which costs either a walk of every match or a prune of the segments that
-          # cannot hold one. Same set, same rate as the plain row above, so the two are directly
-          # comparable and the difference is the price of ORDER BY.
+          # cannot hold one.
+          #
+          # NOTE: this row is NOT compared with the plain char2 rows above to price ORDER BY. The
+          #       index picks its walk from its own 'order_by' option, not from the query, so on
+          #       this index the plain rows take the ordered walk too and the two should agree --
+          #       which is itself worth confirming. The price of ordering is this row against the
+          #       stage-1 run, which served the same names (same generator, same seed) from an
+          #       index without 'order_by': char2 at 10k offered, 9,704 op/s, 6.57 ms service time.
           - set: char2
             ordered: true
             concurrency: 64

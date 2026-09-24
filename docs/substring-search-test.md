@@ -11,7 +11,7 @@ It exists to answer the questions the feature design left open:
 | Do containment queries meet p99 < 100 ms at 10M names, and at what throughput? | one latency table per `expected_p99_read_ms` in the plan, one row per query configuration |
 | How much memory does the index cost per indexed name? | **Substring Index Size**: bytes, bytes per name and segment count |
 | How long does the index take to build, and at what rate? | **Substring Index Build Time**, from the build-oriented plan only |
-| What does `ORDER BY` cost, and does a later page cost more than the first? | the ordered and windowed rows of the latency table, next to the plain ones |
+| What does `ORDER BY` cost, and does a later page cost more than the first? | the ordered rows against the stage-1 run's plain ones, and the windowed rows against the ordered |
 | Does that depend on the order the rows arrived in? | the `names_10M_shuffled` dataset, same corpus, adverse arrival order |
 
 The default plan answers the first two and deliberately does not measure the third: it indexes while
@@ -82,6 +82,12 @@ The shape goes into the Argus **row label**, not into a column, because it chang
 means: an ordered row and a plain row are answers to two different questions rather than two
 configurations of one measurement. Two entries naming one set in one step would otherwise collide
 on the label and push conflicting numbers into a single row.
+
+**An index with `order_by` takes the ordered walk for every query**, plain ones included: the walk
+is chosen from the index's option, not from whether the query said `ORDER BY`. So on such an index a
+plain row and an ordered row of the same set cost the same, and neither is the unordered baseline.
+The price of ordering is an ordered row against a plain row from an index created *without*
+`order_by` -- in practice the stage-1 run, which served the same names.
 
 `ordered` and `window` need `order_by: 'register_time'` in the test case's
 `latte_schema_parameters`, which is what gives the table its sort column and the index its option.
