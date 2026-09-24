@@ -19,7 +19,7 @@ import datetime
 import logging
 
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError
 from gimme_aws_creds.main import GimmeAWSCreds
 from gimme_aws_creds.ui import CLIUserInterface
 
@@ -42,7 +42,10 @@ def can_get_to_aws_account():
         response = sts.get_caller_identity()
         assert response["Account"] == account_id
         LOGGER.info("logged in as %s", response["Arn"])
-    except (NoCredentialsError, AssertionError):
+    except (NoCredentialsError, AssertionError, ClientError):
+        # An expired token is the case this whole function exists to detect, and STS reports it as a
+        # ClientError rather than by failing to find credentials -- so without it here, the one
+        # condition the Okta re-login is for crashes the CLI instead of triggering it.
         LOGGER.exception("failed")
         return False
     return True
