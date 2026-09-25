@@ -32,6 +32,7 @@ TestConfig.init_argus_client resolves to the replay-only client instead, and eve
 JSONL into the run's logdir rather than posted -- which is how this test is normally run.
 """
 
+import os
 import re
 import time
 
@@ -39,6 +40,7 @@ from argus.client.generic_result import ColumnMetadata, ResultType, StaticGeneri
 
 from sdcm.argus_results import submit_results_to_argus
 from search_perf_test import (
+    DEFAULT_MAX_INDEX_WAIT,
     DEFAULT_SCHEMA_TIMEOUT,
     LatteScriptParams,
     SearchPerformanceTest,
@@ -103,6 +105,25 @@ _LABEL_RE = re.compile(r'(?P<name>\w+)="(?P<value>[^"]*)"')
 # The '-P' name that makes substring.rn create the index in its 'schema' phase. Not part of
 # LatteScriptParams, which describes only what the shared flow drives.
 WITH_INDEX_PARAM = "with_index"
+# The '-P' name carrying extra WITH OPTIONS entries verbatim ("'poc_option_1': 'true'").
+EXTRA_INDEX_OPTIONS_PARAM = "extra_index_options"
+
+# A dataset may ask for several indexes over the one load, differing only in their options:
+#
+#   index_variants:
+#     - label: store_id
+#     - label: fast_id
+#       options: {poc_option_1: 'true'}
+#
+# All of them are created before the load and ingest the same CDC stream, so they get equivalent
+# layouts, which two separate runs would not (merge timing differs per run). ScyllaDB picks one of
+# them for every query and the choice is not by name, so each round of the query sets first finds
+# out which index is serving (a short probe, then a look at which one's search total moved), labels
+# its rows with that variant, and drops the index afterwards so the next round reaches another.
+# Needs 'index_during_load': a variant built by a full scan after the load would have a different
+# layout from one fed by CDC, and the comparison would be about that instead.
+INDEX_VARIANTS_KEY = "index_variants"
+SERVED_INDEX_PROBE_DURATION = "5s"
 
 # Polling for 'index_during_load'. The count is asked for on this interval while the index catches
 # up with the load; the settle loop then watches the segment count until it stops moving, because
@@ -200,6 +221,39 @@ def parse_index_gauge(metrics_text: str, metric: str, keyspace: str, index_name:
     return None
 
 
+def checked_index_variants(dataset: dict) -> list[dict]:
+    """The dataset's 'index_variants' as [{label, options}], validated, or [] when it has none."""
+    variants = dataset.get(INDEX_VARIANTS_KEY) or []
+    if not variants:
+        return []
+    if not dataset.get("index_during_load"):
+        raise ValueError(f"Dataset {dataset.get('name')!r}: '{INDEX_VARIANTS_KEY}' needs 'index_during_load: true'")
+    checked = []
+    for variant in variants:
+        if not isinstance(variant, dict) or "label" not in variant:
+            raise ValueError(f"Dataset {dataset.get('name')!r}: every index variant needs a 'label'")
+        label = _checked_name(str(variant["label"]), "index variant label")
+        options = variant.get("options") or {}
+        if not isinstance(options, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in options.items()):
+            raise ValueError(f"Index variant {label!r}: 'options' must map option names to string values")
+        index_options_fragment(options)  # rejects what cannot be quoted into the CREATE statement
+        if any(label == seen["label"] for seen in checked):
+            raise ValueError(f"Index variant label {label!r} is used twice")
+        checked.append({"label": label, "options": options})
+    return checked
+
+
+def index_options_fragment(options: dict) -> str:
+    """The extra WITH OPTIONS entries as substring.rn splices them in: "'k': 'v', 'k2': 'v2'"."""
+    parts = []
+    for name, value in sorted(options.items()):
+        for text in (name, value):
+            if not text or any(ch in text for ch in "'\\\"$`"):
+                raise ValueError(f"Index option {name!r}={value!r} cannot be quoted into a CREATE statement")
+        parts.append(f"'{name}': '{value}'")
+    return ", ".join(parts)
+
+
 def parse_index_gauge_series(metrics_text: str, metric: str, keyspace: str, index_name: str, label: str) -> dict[str, float]:
     """Every sample of one gauge for one index, keyed by the value of *label*.
 
@@ -293,8 +347,13 @@ class SubstringSearchTest(SearchPerformanceTest):
         ordered = bool(query.get("ordered", False))
         window = _checked_window(query.get("window", 0.0))
         if window > 0.0:
-            return f" ordered from {window:g}" if ordered else f" window from {window:g}"
-        return " ordered" if ordered else ""
+            shape = f" ordered from {window:g}" if ordered else f" window from {window:g}"
+        else:
+            shape = " ordered" if ordered else ""
+        # Which of the dataset's index variants answered; "" outside a variant round. Looked up
+        # rather than read, since plan validation calls this on a stand-in for the test.
+        variant = getattr(self, "_variant_label", "")
+        return f"{shape} [{variant}]" if variant else shape
 
     def extra_search_params(self, query: dict, record_count: int) -> str:
         """Translate the plan's 'ordered' and 'window' keys into substring.rn's '-P' flags.
@@ -329,6 +388,12 @@ class SubstringSearchTest(SearchPerformanceTest):
     _dataset_name = ""
     _step_idx = -1
     _ingesting_index_name = ""
+    _max_index_wait = DEFAULT_MAX_INDEX_WAIT
+    # The dataset's 'index_variants', the ones of the current step still standing (index name ->
+    # label), and the label of the one serving the round in progress.
+    _variants: list = []
+    _live_variants: dict = {}
+    _variant_label = ""
 
     def _run_dataset(self, dataset):
         """Note whether this dataset indexes while it loads, then run it as usual.
@@ -342,6 +407,10 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._dataset_name = _checked_name(dataset["name"], "dataset name")
         self._step_idx = -1
         self._ingesting_index_name = ""
+        self._max_index_wait = dataset.get("max_index_wait_secs", DEFAULT_MAX_INDEX_WAIT)
+        self._variants = checked_index_variants(dataset)
+        self._live_variants = {}
+        self._variant_label = ""
         if self._index_during_load:
             self.log.info("Dataset '%s': indexing during load; no build time will be measured", self._dataset_name)
         return super()._run_dataset(dataset)
@@ -353,20 +422,31 @@ class SubstringSearchTest(SearchPerformanceTest):
             # The name the flow will build this step under. Recomputed rather than passed, because
             # the load happens before the flow names the index -- _build_index checks the two agree.
             self._ingesting_index_name = f"{self.WORKLOAD.index_prefix}_{self._dataset_name}_{self._step_idx}"
-            self._create_index_for_ingestion(self._ingesting_index_name)
+            if self._variants:
+                # One index per variant, named after it; the flow's own name stays the handle the
+                # step is built and dropped under (see _drop_index).
+                self._live_variants = {}
+                for variant in self._variants:
+                    name = f"{self._ingesting_index_name}_{variant['label']}"
+                    self._create_index_for_ingestion(name, index_options_fragment(variant["options"]))
+                    self._live_variants[name] = variant["label"]
+            else:
+                self._create_index_for_ingestion(self._ingesting_index_name)
         return super()._load_step_shards(step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait)
 
-    def _create_index_for_ingestion(self, index_name):
+    def _create_index_for_ingestion(self, index_name, options_fragment=""):
         """Create the index up front, so that rows are indexed as they are written.
 
         Only the index existing in the schema matters, not which statement created it: the index
         node picks it up and ingests the base table's CDC log either way.
         """
         self.log.info("Creating index '%s' before the load, to index while loading", index_name)
+        extra = f'-P {EXTRA_INDEX_OPTIONS_PARAM}=\\"{options_fragment}\\" ' if options_fragment else ""
         self._run_latte(
             f"latte schema {self.WORKLOAD.script} "
             f"-P {WITH_INDEX_PARAM}=true "
-            f'-P {self.WORKLOAD.params.index_name}=\\"{index_name}\\" ',
+            f'-P {self.WORKLOAD.params.index_name}=\\"{index_name}\\" '
+            f"{extra}",
             duration=_timeout_minutes(DEFAULT_SCHEMA_TIMEOUT),
         )
 
@@ -383,15 +463,99 @@ class SubstringSearchTest(SearchPerformanceTest):
                     f"Indexed into {self._ingesting_index_name!r} during the load but the flow "
                     f"expects {index_name!r}; the index naming in search_perf_test.py has changed"
                 )
-            self._wait_for_index_count(keyspace, index_name, record_count, max_index_wait)
-            self._wait_for_index_settled(keyspace, index_name, max_index_wait)
+            for name in self._live_variants or [index_name]:
+                self._wait_for_index_count(keyspace, name, record_count, max_index_wait)
+                self._wait_for_index_settled(keyspace, name, max_index_wait)
+                self._report_index_size(keyspace, name, record_count)
             build_seconds = None  # nothing was built here, so there is no build time to report
         else:
             build_seconds = super()._build_index(record_count, max_index_wait, index_name=index_name, keyspace=keyspace)
+            self._report_index_size(keyspace, index_name, record_count)
         # The index the query phases that follow will be priced against (see 'search_phase_end').
-        self._queried_index = (keyspace, index_name)
-        self._report_index_size(keyspace, index_name, record_count)
+        # With variants it is not known until a round finds out which one serves.
+        self._queried_index = None if self._live_variants else (keyspace, index_name)
         return build_seconds
+
+    def _run_step_queries(self, step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir):
+        """Run the step's query sets once per index variant, or once as usual without variants."""
+        if not self._live_variants:
+            return super()._run_step_queries(
+                step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
+            )
+        keyspace = self._keyspace()
+        while self._live_variants:
+            served = self._detect_served_index(keyspace, step, defaults, local_ds_dir, remote_ds_dir)
+            self._variant_label = self._live_variants[served]
+            self._queried_index = (keyspace, served)
+            self.log.info(
+                "Query round against index '%s' (variant '%s'); %d variant(s) to go after it",
+                served,
+                self._variant_label,
+                len(self._live_variants) - 1,
+            )
+            try:
+                super()._run_step_queries(
+                    step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
+                )
+            finally:
+                self._variant_label = ""
+            if len(self._live_variants) == 1:
+                break  # the last one is dropped by the flow, under the step's own name
+            self._drop_index(served, keyspace, self._max_index_wait)
+        return None
+
+    def _keyspace(self) -> str:
+        return (self.params.get("latte_schema_parameters") or {}).get("keyspace") or self.WORKLOAD.default_keyspace
+
+    def _detect_served_index(self, keyspace, step, defaults, local_ds_dir, remote_ds_dir) -> str:
+        """Which of the live variant indexes ScyllaDB routes the step's queries to.
+
+        A few seconds of the first query set, plain, bracketed by two scrapes of every candidate's
+        search total: the one that moved is the one serving. The choice is ScyllaDB's and stable
+        for as long as the set of indexes does not change, which is why a round ends by dropping
+        the index it measured.
+        """
+        params = self.WORKLOAD.params
+        qset = _checked_name(step["queries"][0]["set"], "query set name")
+        queries_file = f"queries_{qset}.tsv"
+        before = self._scrape_search_totals(keyspace, list(self._live_variants))
+        self._run_latte(
+            f"latte run -f search {self.WORKLOAD.script} --duration {SERVED_INDEX_PROBE_DURATION} "
+            rf"-P {params.dataset_dir}=\"{remote_ds_dir}/\" "
+            rf"-P {params.queries_file}=\"{queries_file}\" "
+            f"-P {params.compute_accuracy}=false "
+            f"-P {params.search_limit}={defaults.get('limit', 20)} "
+            f"--concurrency=4 --retry-number 1 ",
+            files_to_stage=[(os.path.join(local_ds_dir, queries_file), os.path.join(remote_ds_dir, queries_file))],
+        )
+        after = self._scrape_search_totals(keyspace, list(self._live_variants))
+        moved = {name: after.get(name, 0.0) - before.get(name, 0.0) for name in self._live_variants}
+        served = max(moved, key=moved.get)
+        if moved[served] <= 0:
+            raise RuntimeError(f"The probe reached none of the candidate indexes {sorted(self._live_variants)}: {moved}")
+        return served
+
+    def _scrape_search_totals(self, keyspace, index_names) -> dict[str, float]:
+        """'substring_search_total' per index, for the ones that export it."""
+        metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
+        totals = {}
+        for name in index_names:
+            value = parse_index_gauge(metrics_text, SEARCHES_METRIC, keyspace, name)
+            if value is not None:
+                totals[name] = value
+        return totals
+
+    def _drop_index(self, index_name, keyspace, max_index_wait):
+        """Drop one index -- or, asked for the step's own name while variants stand, all of them."""
+        if index_name in self._live_variants:
+            super()._drop_index(index_name, keyspace, max_index_wait)
+            del self._live_variants[index_name]
+            return
+        if index_name == self._ingesting_index_name and self._live_variants:
+            for name in list(self._live_variants):
+                self._drop_index(name, keyspace, max_index_wait)
+            return
+        super()._drop_index(index_name, keyspace, max_index_wait)
 
     def search_extra_columns(self):
         return super().search_extra_columns() + WALK_COLUMNS
