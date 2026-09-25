@@ -146,8 +146,9 @@ To compare two index configurations on the same layout, a dataset can declare `i
 before the load and ingests the same CDC stream, then the step's query sets run once per variant,
 with `[label]` at the end of each row label. ScyllaDB decides which index answers a query and not
 by name, so each round starts with a five-second probe to find out which one is serving, and ends
-by dropping it so the next round reaches another. The size row, the layout and the per-query walk
-columns are reported per variant. `poc_option_1..4` are placeholders ScyllaDB stores and passes
+by dropping it so the next round reaches another. The size row (with `catch_up_secs`, how long after the
+load each index held every row -- the ingestion cost of its options), the layout and the per-query
+walk columns are reported per variant. `poc_option_1..4` are placeholders ScyllaDB stores and passes
 through; what they mean is vector-store's business and is documented there (at the time of
 writing: `poc_option_1` keeps the primary id as a column, `poc_option_2` caps segment size and
 switches on the range-aware merge policy).

@@ -174,6 +174,10 @@ class SubstringIndexSizeResult(StaticGenericResultTable):
             # is to say so before the query rows are read.
             ColumnMetadata(name="segment_span_mean_pct", unit="%", type=ResultType.FLOAT, higher_is_better=False),
             ColumnMetadata(name="segment_span_max_pct", unit="%", type=ResultType.FLOAT, higher_is_better=False),
+            # How long after the load ended the index held every row, when indexing during the
+            # load. The ingestion cost of an index option -- a merge policy that rewrites its tail
+            # on every commit, say -- shows up here and nowhere else.
+            ColumnMetadata(name="catch_up_secs", unit="s", type=ResultType.FLOAT, higher_is_better=False),
         ]
 
 
@@ -447,7 +451,10 @@ class SubstringSearchTest(SearchPerformanceTest):
                     self._live_variants[name] = variant["label"]
             else:
                 self._create_index_for_ingestion(self._ingesting_index_name)
-        return super()._load_step_shards(step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait)
+        loaded = super()._load_step_shards(step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait)
+        # The clock the catch-up time of an index ingesting during the load is measured from.
+        self._load_finished_at = time.monotonic()
+        return loaded
 
     def _create_index_for_ingestion(self, index_name, option_params=""):
         """Create the index up front, so that rows are indexed as they are written.
@@ -477,10 +484,11 @@ class SubstringSearchTest(SearchPerformanceTest):
                     f"Indexed into {self._ingesting_index_name!r} during the load but the flow "
                     f"expects {index_name!r}; the index naming in search_perf_test.py has changed"
                 )
-            for name in self._live_variants or [index_name]:
-                self._wait_for_index_count(keyspace, name, record_count, max_index_wait)
+            names = list(self._live_variants) or [index_name]
+            catch_up = self._wait_for_indexes_count(keyspace, names, record_count, max_index_wait)
+            for name in names:
                 self._wait_for_index_settled(keyspace, name, max_index_wait)
-                self._report_index_size(keyspace, name, record_count)
+                self._report_index_size(keyspace, name, record_count, catch_up_secs=catch_up.get(name))
             build_seconds = None  # nothing was built here, so there is no build time to report
         else:
             build_seconds = super()._build_index(record_count, max_index_wait, index_name=index_name, keyspace=keyspace)
@@ -632,6 +640,48 @@ class SubstringSearchTest(SearchPerformanceTest):
         if len(segments) > SEGMENT_LAYOUT_LOG_ROWS:
             self.log.info("  ... and %d more", len(segments) - SEGMENT_LAYOUT_LOG_ROWS)
 
+    def _wait_for_indexes_count(self, keyspace, index_names, record_count, timeout) -> dict[str, float]:
+        """Wait until every named index holds every loaded row; per index, how long after the load
+        it got there.
+
+        Polled together rather than one after another, so that an index that caught up while
+        another was still ingesting is credited with the time it actually took.
+        """
+        client = self._vector_store_api_client()
+        load_end = getattr(self, "_load_finished_at", None) or time.monotonic()
+        deadline = time.monotonic() + timeout
+        pending = {name: -1 for name in index_names}
+        caught_up = {}
+        while pending:
+            for name in list(pending):
+                status = client.get_index_status_or_none(keyspace.lower(), name.lower())
+                count = (status or {}).get("count", 0)
+                if count >= record_count:
+                    caught_up[name] = round(max(time.monotonic() - load_end, 0.0), 1)
+                    self.log.info(
+                        "Index '%s' has caught up: %d of %d %s, %.1f s after the load",
+                        name,
+                        count,
+                        record_count,
+                        self.WORKLOAD.item_noun,
+                        caught_up[name],
+                    )
+                    del pending[name]
+                elif count != pending[name]:
+                    self.log.info(
+                        "Index '%s' ingesting: %d of %d %s", name, count, record_count, self.WORKLOAD.item_noun
+                    )
+                    pending[name] = count
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Indexes {sorted(pending)} had not caught up with {record_count} "
+                    f"{self.WORKLOAD.item_noun} after {timeout}s of ingestion: {pending}"
+                )
+            time.sleep(INDEX_COUNT_POLL_INTERVAL_SECS)
+        return caught_up
+
     def _wait_for_index_count(self, keyspace, index_name, record_count, timeout):
         """Wait until the index holds every row that was loaded.
 
@@ -702,7 +752,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             return None
         return parse_index_gauge(metrics_text, metric, keyspace, index_name)
 
-    def _report_index_size(self, keyspace, index_name, record_count):
+    def _report_index_size(self, keyspace, index_name, record_count, catch_up_secs=None):
         """Read the index size gauges off the vector-store node and submit them as one row.
 
         A missing gauge is reported as a missing measurement rather than a failure, exactly as a
@@ -750,6 +800,8 @@ class SubstringSearchTest(SearchPerformanceTest):
                 column="segment_span_mean_pct", row=row_key, value=round(sum(spans_pct) / len(spans_pct), 2), status=Status.UNSET
             )
             result_table.add_result(column="segment_span_max_pct", row=row_key, value=max(spans_pct), status=Status.UNSET)
+        if catch_up_secs is not None:
+            result_table.add_result(column="catch_up_secs", row=row_key, value=catch_up_secs, status=Status.UNSET)
         submit_results_to_argus(self.test_config.argus_client(), result_table)
 
     def test_substring_search(self):
