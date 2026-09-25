@@ -55,13 +55,13 @@ datasets:
   # No build time is reported for this dataset, by design.
   - name: local_ingest
     index_during_load: true
-    # Two indexes over the one load, to exercise the variant rounds: the primary id in the store
-    # only, and also as a FAST column (poc_option_1 as vector-store reads it). Every query row
-    # below is reported twice, '[store_id]' and '[fast_id]'.
+    # Two indexes over the one load, to exercise the variant rounds: Tantivy's default merge
+    # policy, and the range-aware one capped at 500 rows per segment (poc_option_2 as
+    # vector-store reads it). Every query row below is reported twice, '[default]' and '[p3a]'.
     index_variants:
-      - label: store_id
-      - label: fast_id
-        options: {poc_option_1: 'true'}
+      - label: default
+      - label: p3a
+        options: {poc_option_2: '500'}
     max_index_wait_secs: 300
     defaults:
       limit: 20

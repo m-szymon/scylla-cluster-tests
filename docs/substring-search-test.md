@@ -148,7 +148,9 @@ with `[label]` at the end of each row label. ScyllaDB decides which index answer
 by name, so each round starts with a five-second probe to find out which one is serving, and ends
 by dropping it so the next round reaches another. The size row, the layout and the per-query walk
 columns are reported per variant. `poc_option_1..4` are placeholders ScyllaDB stores and passes
-through; what they mean is vector-store's business and is documented there.
+through; what they mean is vector-store's business and is documented there (at the time of
+writing: `poc_option_1` keeps the primary id as a column, `poc_option_2` caps segment size and
+switches on the range-aware merge policy).
 
 The corpus now carries a third column (`user_id<TAB>nickname<TAB>register_time`), so a corpus
 generated before this existed has to be regenerated before an ordered run. The rune script says so
