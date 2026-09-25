@@ -134,8 +134,9 @@ span of the sort column as a share of the whole range, from vector-store's per-s
 (`substring_segment_docs`, `substring_segment_sort_min/max`), and the test log lists every segment.
 A mean near 100% means no segment can ever be skipped. Then every latency row carries what one
 query cost the index, from the delta of the walk totals (`substring_search_*_total`) over the phase:
-`walk_us_per_query`, `page_resolve_us_per_query` (the part of the walk spent turning the page into
-primary ids), `segments_considered_per_query`, `segments_opened_per_query`,
+`walk_us_per_query`, `prepare_us_per_query` (the part of the walk spent reading segment bounds before
+the first posting) and `column_opens_per_query` (columns opened for it), `page_resolve_us_per_query`
+(the part spent turning the page into primary ids), `segments_considered_per_query`, `segments_opened_per_query`,
 `postings_per_query`, `heap_entrants_per_query` and `store_reads_per_query`. Postings scanned is
 the number to read first: an ordered query that scans tens of thousands of postings for a page of
 20 is walking segments it could not skip, and that is a layout problem, not a query one.

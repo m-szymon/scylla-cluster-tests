@@ -89,6 +89,10 @@ WALK_PER_QUERY_METRICS = {
     # Part of the walk time: turning the page into primary ids, which is the store reads unless
     # the index keeps the id as a column.
     "page_resolve_us_per_query": ("substring_search_page_resolve_seconds_total", 1e6),
+    # Also part of the walk time: reading every segment's bounds before the first posting, and
+    # how many columns had to be opened for it (misses of vector-store's per-segment cache).
+    "prepare_us_per_query": ("substring_search_prepare_seconds_total", 1e6),
+    "column_opens_per_query": ("substring_search_column_opens_total", 1),
     "segments_considered_per_query": ("substring_search_segments_considered_total", 1),
     "segments_opened_per_query": ("substring_search_segments_opened_total", 1),
     "postings_per_query": ("substring_search_postings_scanned_total", 1),
