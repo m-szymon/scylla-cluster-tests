@@ -41,7 +41,7 @@ from substring_test import (
     WITH_INDEX_PARAM,
     SubstringIndexBuildResult,
     checked_index_variants,
-    index_options_fragment,
+    index_option_params,
     parse_index_gauge,
     parse_segment_layout,
     segment_spans_pct,
@@ -262,17 +262,19 @@ def test_variants_are_validated_and_normalised():
     ({"name": "d", "index_during_load": True, "index_variants": [{"options": {}}]}, "needs a 'label'"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a"}, {"label": "a"}]}, "used twice"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": 1}}]}, "string values"),
-    ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "it's"}}]}, "quoted"),
+    ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "it's"}}]}, "only letters"),
+    ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "1", "j": "2"}}]}, "one extra option"),
 ])
 def test_bad_variants_are_plan_errors(dataset, error):
     with pytest.raises(ValueError, match=error):
         checked_index_variants(dataset)
 
 
-def test_the_options_fragment_is_what_the_script_splices_in(script_source):
-    assert index_options_fragment({"poc_option_2": "x", "poc_option_1": "true"}) == "'poc_option_1': 'true', 'poc_option_2': 'x'"
-    assert index_options_fragment({}) == ""
-    assert 'param!("extra_index_options"' in script_source
+def test_the_option_params_are_the_ones_the_script_takes(script_source):
+    assert index_option_params({"poc_option_1": "true"}) == '-P extra_option_name=\\"poc_option_1\\" -P extra_option_value=\\"true\\" '
+    assert index_option_params({}) == ""
+    assert 'param!("extra_option_name"' in script_source
+    assert 'param!("extra_option_value"' in script_source
 
 
 def test_the_variant_label_ends_the_row_label():

@@ -108,8 +108,10 @@ _LABEL_RE = re.compile(r'(?P<name>\w+)="(?P<value>[^"]*)"')
 # The '-P' name that makes substring.rn create the index in its 'schema' phase. Not part of
 # LatteScriptParams, which describes only what the shared flow drives.
 WITH_INDEX_PARAM = "with_index"
-# The '-P' name carrying extra WITH OPTIONS entries verbatim ("'poc_option_1': 'true'").
-EXTRA_INDEX_OPTIONS_PARAM = "extra_index_options"
+# The '-P' names carrying one extra WITH OPTIONS entry, name and value apart: latte splices a
+# value into the script as a literal, so a quoted fragment would not parse.
+EXTRA_OPTION_NAME_PARAM = "extra_option_name"
+EXTRA_OPTION_VALUE_PARAM = "extra_option_value"
 
 # A dataset may ask for several indexes over the one load, differing only in their options:
 #
@@ -239,22 +241,28 @@ def checked_index_variants(dataset: dict) -> list[dict]:
         options = variant.get("options") or {}
         if not isinstance(options, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in options.items()):
             raise ValueError(f"Index variant {label!r}: 'options' must map option names to string values")
-        index_options_fragment(options)  # rejects what cannot be quoted into the CREATE statement
+        index_option_params(options)  # rejects what the script cannot carry
         if any(label == seen["label"] for seen in checked):
             raise ValueError(f"Index variant label {label!r} is used twice")
         checked.append({"label": label, "options": options})
     return checked
 
 
-def index_options_fragment(options: dict) -> str:
-    """The extra WITH OPTIONS entries as substring.rn splices them in: "'k': 'v', 'k2': 'v2'"."""
-    parts = []
-    for name, value in sorted(options.items()):
-        for text in (name, value):
-            if not text or any(ch in text for ch in "'\\\"$`"):
-                raise ValueError(f"Index option {name!r}={value!r} cannot be quoted into a CREATE statement")
-        parts.append(f"'{name}': '{value}'")
-    return ", ".join(parts)
+def index_option_params(options: dict) -> str:
+    """The '-P' flags carrying a variant's extra index option to substring.rn, or "" for none.
+
+    One option per variant for now, which is what the script takes; the value and name are plain
+    words, since they travel through a shell command line and into a rune literal.
+    """
+    if not options:
+        return ""
+    if len(options) > 1:
+        raise ValueError(f"An index variant can set one extra option, not {sorted(options)}")
+    ((name, value),) = options.items()
+    for text in (name, value):
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", text):
+            raise ValueError(f"Index option {name!r}={value!r}: only letters, digits, '_', '.' and '-' can be passed")
+    return f'-P {EXTRA_OPTION_NAME_PARAM}=\\"{name}\\" -P {EXTRA_OPTION_VALUE_PARAM}=\\"{value}\\" '
 
 
 def parse_index_gauge_series(metrics_text: str, metric: str, keyspace: str, index_name: str, label: str) -> dict[str, float]:
@@ -431,25 +439,24 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self._live_variants = {}
                 for variant in self._variants:
                     name = f"{self._ingesting_index_name}_{variant['label']}"
-                    self._create_index_for_ingestion(name, index_options_fragment(variant["options"]))
+                    self._create_index_for_ingestion(name, index_option_params(variant["options"]))
                     self._live_variants[name] = variant["label"]
             else:
                 self._create_index_for_ingestion(self._ingesting_index_name)
         return super()._load_step_shards(step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait)
 
-    def _create_index_for_ingestion(self, index_name, options_fragment=""):
+    def _create_index_for_ingestion(self, index_name, option_params=""):
         """Create the index up front, so that rows are indexed as they are written.
 
         Only the index existing in the schema matters, not which statement created it: the index
         node picks it up and ingests the base table's CDC log either way.
         """
         self.log.info("Creating index '%s' before the load, to index while loading", index_name)
-        extra = f'-P {EXTRA_INDEX_OPTIONS_PARAM}=\\"{options_fragment}\\" ' if options_fragment else ""
         self._run_latte(
             f"latte schema {self.WORKLOAD.script} "
             f"-P {WITH_INDEX_PARAM}=true "
             f'-P {self.WORKLOAD.params.index_name}=\\"{index_name}\\" '
-            f"{extra}",
+            f"{option_params}",
             duration=_timeout_minutes(DEFAULT_SCHEMA_TIMEOUT),
         )
 

@@ -141,7 +141,7 @@ the number to read first: an ordered query that scans tens of thousands of posti
 20 is walking segments it could not skip, and that is a layout problem, not a query one.
 
 To compare two index configurations on the same layout, a dataset can declare `index_variants`
-(each a `label` and optional `options`, e.g. `{poc_option_1: 'true'}`): every variant is created
+(each a `label` and optionally one extra option, e.g. `options: {poc_option_1: 'true'}`): every variant is created
 before the load and ingests the same CDC stream, then the step's query sets run once per variant,
 with `[label]` at the end of each row label. ScyllaDB decides which index answers a query and not
 by name, so each round starts with a five-second probe to find out which one is serving, and ends
