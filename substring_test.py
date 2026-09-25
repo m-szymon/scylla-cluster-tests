@@ -86,6 +86,9 @@ SEARCHES_METRIC = "substring_search_total"
 # Column of the search latency table -> (metric, unit scale applied to the per-query value).
 WALK_PER_QUERY_METRICS = {
     "walk_us_per_query": ("substring_search_walk_seconds_total", 1e6),
+    # Part of the walk time: turning the page into primary ids, which is the store reads unless
+    # the index keeps the id as a column.
+    "page_resolve_us_per_query": ("substring_search_page_resolve_seconds_total", 1e6),
     "segments_considered_per_query": ("substring_search_segments_considered_total", 1),
     "segments_opened_per_query": ("substring_search_segments_opened_total", 1),
     "postings_per_query": ("substring_search_postings_scanned_total", 1),
@@ -94,7 +97,7 @@ WALK_PER_QUERY_METRICS = {
 }
 SEARCHES_COLUMN = "index_searches"
 WALK_COLUMNS = [ColumnMetadata(name=SEARCHES_COLUMN, unit="", type=ResultType.INTEGER)] + [
-    ColumnMetadata(name=column, unit="us" if column.startswith("walk_us") else "", type=ResultType.FLOAT, higher_is_better=False)
+    ColumnMetadata(name=column, unit="us" if column.endswith("_us_per_query") else "", type=ResultType.FLOAT, higher_is_better=False)
     for column in WALK_PER_QUERY_METRICS
 ]
 # How many segments the layout log lists in full; the summary columns cover the rest.
