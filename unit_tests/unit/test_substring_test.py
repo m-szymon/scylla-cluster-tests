@@ -31,12 +31,19 @@ import pytest
 import substring_test
 from substring_test import (
     INDEX_SIZE_METRIC,
+    SEARCHES_COLUMN,
+    SEARCHES_METRIC,
     SEGMENT_COUNT_METRIC,
     SUBSTRING_BUILD_COUNT_COLUMN,
     SUBSTRING_WORKLOAD,
+    WALK_COLUMNS,
+    WALK_PER_QUERY_METRICS,
     WITH_INDEX_PARAM,
     SubstringIndexBuildResult,
     parse_index_gauge,
+    parse_segment_layout,
+    segment_spans_pct,
+    walk_per_query,
 )
 from sdcm import sct_abs_path
 
@@ -159,6 +166,78 @@ def test_a_missing_gauge_is_no_measurement_rather_than_an_error():
     both look like this -- and neither should end a run that is otherwise fine."""
     assert parse_index_gauge(METRICS_SAMPLE, INDEX_SIZE_METRIC, "substring_bench", "sub_idx_absent") is None
     assert parse_index_gauge("", INDEX_SIZE_METRIC, "substring_bench", "sub_idx_names_10M_0") is None
+
+
+# --- what the index did -------------------------------------------------------------------------
+
+LAYOUT_SAMPLE = """\
+substring_segment_docs{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="0"} 4000000
+substring_segment_docs{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="1"} 5000000
+substring_segment_docs{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="2"} 1000000
+substring_segment_docs{index_name="sub_idx_names_10m_1",keyspace="substring_bench",segment="0"} 7
+substring_segment_sort_min{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="0"} 0
+substring_segment_sort_max{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="0"} 4000000
+substring_segment_sort_min{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="1"} 3000000
+substring_segment_sort_max{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="1"} 10000000
+substring_segment_sort_min{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="2"} 9000000
+substring_segment_sort_max{index_name="sub_idx_names_10m_0",keyspace="substring_bench",segment="2"} 10000000
+"""
+
+
+def test_segment_layout_is_read_by_ordinal_for_the_named_index():
+    layout = parse_segment_layout(LAYOUT_SAMPLE, "substring_bench", "sub_idx_names_10M_0")
+    assert layout == [
+        (0, 4000000, 0, 4000000),
+        (1, 5000000, 3000000, 10000000),
+        (2, 1000000, 9000000, 10000000),
+    ]
+
+
+def test_an_unordered_index_has_segments_without_bounds():
+    assert parse_segment_layout(LAYOUT_SAMPLE, "substring_bench", "sub_idx_names_10M_1") == [(0, 7, None, None)]
+    assert parse_segment_layout("", "substring_bench", "sub_idx_names_10M_0") == []
+
+
+def test_segment_spans_are_a_share_of_the_whole_range():
+    layout = parse_segment_layout(LAYOUT_SAMPLE, "substring_bench", "sub_idx_names_10M_0")
+    assert segment_spans_pct(layout) == [40.0, 70.0, 10.0]
+
+
+def test_a_layout_with_nothing_to_prune_by_spans_nothing():
+    """Unordered, or every value the same: either way the pruning has nothing to work with."""
+    assert segment_spans_pct([(0, 7, None, None), (1, 3, None, None)]) == [0.0, 0.0]
+    assert segment_spans_pct([(0, 7, 5, 5), (1, 3, 5, 5)]) == [0.0, 0.0]
+    assert segment_spans_pct([]) == []
+
+
+def _totals(searches, **per_metric):
+    totals = {SEARCHES_METRIC: searches}
+    for column, (metric, _) in WALK_PER_QUERY_METRICS.items():
+        if column in per_metric:
+            totals[metric] = per_metric[column]
+    return totals
+
+
+def test_the_walk_is_priced_per_query_over_the_phase():
+    before = _totals(100, walk_us_per_query=1.0, segments_opened_per_query=10, postings_per_query=1000)
+    after = _totals(300, walk_us_per_query=1.1, segments_opened_per_query=410, postings_per_query=201000)
+    cells = walk_per_query(before, after)
+    assert cells[SEARCHES_COLUMN] == 200
+    assert cells["walk_us_per_query"] == pytest.approx(500.0)
+    assert cells["segments_opened_per_query"] == 2.0
+    assert cells["postings_per_query"] == 1000.0
+    # A total the scrape did not have is a cell left empty, not a zero.
+    assert "store_reads_per_query" not in cells
+
+
+def test_a_phase_that_reached_no_search_is_not_priced():
+    assert walk_per_query(_totals(100), _totals(100)) == {}
+    assert walk_per_query({}, {}) == {}
+
+
+def test_every_priced_quantity_is_a_column():
+    names = {column.name for column in WALK_COLUMNS}
+    assert names == {SEARCHES_COLUMN, *WALK_PER_QUERY_METRICS}
 
 
 # --- ordering ---------------------------------------------------------------------------------

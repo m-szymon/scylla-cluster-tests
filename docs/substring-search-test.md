@@ -10,6 +10,7 @@ It exists to answer the questions the feature design left open:
 |---|---|
 | Do containment queries meet p99 < 100 ms at 10M names, and at what throughput? | one latency table per `expected_p99_read_ms` in the plan, one row per query configuration |
 | How much memory does the index cost per indexed name? | **Substring Index Size**: bytes, bytes per name and segment count |
+| Can an ordered query skip segments, or does it walk every match? | the segment span columns of the size table, and the per-query walk columns of every latency row |
 | How long does the index take to build, and at what rate? | **Substring Index Build Time**, from the build-oriented plan only |
 | What does `ORDER BY` cost, and does a later page cost more than the first? | the ordered rows against the stage-1 run's plain ones, and the windowed rows against the ordered |
 | Does that depend on the order the rows arrived in? | the `names_10M_shuffled` dataset, same corpus, adverse arrival order |
@@ -126,6 +127,17 @@ python3 data_dir/latte/substring_search/generate_local_dataset.py \
 `aws_config.yaml` runs the ordered rows twice, once per corpus. If the two agree, pruning is not
 what carries the ordered query and the segment work P3 plans is less urgent than the design note
 assumes. If the shuffled rows are far worse, the gap is the size of the problem.
+
+Whether pruning happened is reported rather than inferred from the latency. After the index
+settles, the size row carries `segment_span_mean_pct` and `segment_span_max_pct`: each segment's
+span of the sort column as a share of the whole range, from vector-store's per-segment gauges
+(`substring_segment_docs`, `substring_segment_sort_min/max`), and the test log lists every segment.
+A mean near 100% means no segment can ever be skipped. Then every latency row carries what one
+query cost the index, from the delta of the walk totals (`substring_search_*_total`) over the phase:
+`walk_us_per_query`, `segments_considered_per_query`, `segments_opened_per_query`,
+`postings_per_query`, `heap_entrants_per_query` and `store_reads_per_query`. Postings scanned is
+the number to read first: an ordered query that scans tens of thousands of postings for a page of
+20 is walking segments it could not skip, and that is a layout problem, not a query one.
 
 The corpus now carries a third column (`user_id<TAB>nickname<TAB>register_time`), so a corpus
 generated before this existed has to be regenerated before an ordered run. The rune script says so
@@ -256,7 +268,7 @@ retry with backoff and bury everything else.
 | where | what |
 |---|---|
 | `argus_replay_log_*.jsonl` in the logdir | every result row: build time, indexing throughput, index size, bytes per name, and the latency rows |
-| the test log | `Index 'sub_idx_...': N bytes for M names (X bytes/name), S segments` per build, and the build time line next to it |
+| the test log | `Index 'sub_idx_...': N bytes for M names (X bytes/name), S segments` per build, the build time line next to it, the segment layout under `Index '...' layout:` and `Index work per query:` after each query phase |
 | latte's `.hdr` files on the loader | the raw latency histograms behind the p99 |
 | Grafana screenshots, with `n_monitor_nodes: 1` | server side latency and reactor stalls, which is how you tell a slow index node from a slow database |
 

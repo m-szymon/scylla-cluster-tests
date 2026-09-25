@@ -764,9 +764,10 @@ class SearchPerformanceTest(PerformanceRegressionTest):
             cycle_name=cycle_name,
             row_name=row_label,
             error_thresholds=error_thresholds,
-            extra_columns=SEARCH_EXTRA_COLUMNS,
+            extra_columns=self.search_extra_columns(),
         )
         def _do_search(self):
+            phase = self.search_phase_begin()
             files_to_stage = [
                 (os.path.join(local_ds_dir, queries_file), os.path.join(remote_ds_dir, queries_file)),
             ]
@@ -792,8 +793,9 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                 ),
                 files_to_stage=files_to_stage,
             )
+            extra_values.update(self.search_phase_end(phase))
             # Read by 'latency_calculator_decorator': 'hdr_tags' selects the histograms to summarise,
-            # 'extra_values' fills the SEARCH_EXTRA_COLUMNS cells of this row.
+            # 'extra_values' fills the cells of 'search_extra_columns()' for this row.
             return {"hdr_tags": [workload.hdr_tag], "extra_values": extra_values}
 
         with DbEventsFilter(
@@ -919,6 +921,31 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         flow has a single shape, so nothing distinguishes two entries but their configuration.
         """
         return ""
+
+    def search_extra_columns(self) -> list[ColumnMetadata]:
+        """The per-row columns of the search latency tables, beyond the latency ones.
+
+        A workload that measures something about each query phase -- what the index did to answer
+        it, say -- extends this list and fills the cells from 'search_phase_end'.
+        """
+        return SEARCH_EXTRA_COLUMNS
+
+    def search_phase_begin(self):
+        """Called just before a query phase's latte run; whatever it returns reaches 'search_phase_end'.
+
+        The base flow measures nothing here. A workload uses the pair to bracket the phase with
+        something read off the cluster -- a counter before and after -- and turns the difference
+        into cells of the row.
+        """
+        return None
+
+    def search_phase_end(self, phase) -> dict:
+        """Called right after the phase's latte run, with what 'search_phase_begin' returned.
+
+        Returns {column name: value} for columns 'search_extra_columns' declares. A column left out
+        is a cell left empty, which is how a measurement that could not be taken should look.
+        """
+        return {}
 
     def extra_search_params(self, query: dict, record_count: int) -> str:
         """Workload-specific '-P name=value ' flags for a query entry, or "".

@@ -72,6 +72,31 @@ SUBSTRING_BUILD_COUNT_COLUMN = "name_count"
 # business, and the index name is matched case-folded because that is how vector-store knows it.
 INDEX_SIZE_METRIC = "substring_index_size_bytes"
 SEGMENT_COUNT_METRIC = "substring_segment_count"
+# One sample per segment, labelled 'segment' with the segment's ordinal. The bounds are the sort
+# column's values (vector-store undoes the sort-key bias on export), or absent for an unordered index.
+SEGMENT_DOCS_METRIC = "substring_segment_docs"
+SEGMENT_SORT_MIN_METRIC = "substring_segment_sort_min"
+SEGMENT_SORT_MAX_METRIC = "substring_segment_sort_max"
+# Running totals of what the index's searches did, growing since the index was created. The delta
+# over a query phase, divided by the searches served in it, says what one query cost the index --
+# which is what tells a slow walk from a wide-segment layout when the latency alone cannot.
+SEARCHES_METRIC = "substring_search_total"
+# Column of the search latency table -> (metric, unit scale applied to the per-query value).
+WALK_PER_QUERY_METRICS = {
+    "walk_us_per_query": ("substring_search_walk_seconds_total", 1e6),
+    "segments_considered_per_query": ("substring_search_segments_considered_total", 1),
+    "segments_opened_per_query": ("substring_search_segments_opened_total", 1),
+    "postings_per_query": ("substring_search_postings_scanned_total", 1),
+    "heap_entrants_per_query": ("substring_search_heap_entrants_total", 1),
+    "store_reads_per_query": ("substring_search_store_reads_total", 1),
+}
+SEARCHES_COLUMN = "index_searches"
+WALK_COLUMNS = [ColumnMetadata(name=SEARCHES_COLUMN, unit="", type=ResultType.INTEGER)] + [
+    ColumnMetadata(name=column, unit="us" if column.startswith("walk_us") else "", type=ResultType.FLOAT, higher_is_better=False)
+    for column in WALK_PER_QUERY_METRICS
+]
+# How many segments the layout log lists in full; the summary columns cover the rest.
+SEGMENT_LAYOUT_LOG_ROWS = 64
 _METRIC_LINE_RE_TEMPLATE = r"^{metric}\{{(?P<labels>[^}}]*)\}}\s+(?P<value>[0-9.eE+-]+)\s*$"
 _LABEL_RE = re.compile(r'(?P<name>\w+)="(?P<value>[^"]*)"')
 
@@ -113,6 +138,12 @@ class SubstringIndexSizeResult(StaticGenericResultTable):
             ColumnMetadata(name="bytes_per_name", unit="bytes", type=ResultType.FLOAT, higher_is_better=False),
             ColumnMetadata(name=SUBSTRING_BUILD_COUNT_COLUMN, unit="names", type=ResultType.INTEGER),
             ColumnMetadata(name="segment_count", unit="", type=ResultType.INTEGER),
+            # How wide the segments are, as a share of the whole sort-column range. An ordered search
+            # skips a segment only when its span cannot hold a page entry, so a mean near 100% means
+            # nothing is skipped and every ordered query walks every match; the point of these two
+            # is to say so before the query rows are read.
+            ColumnMetadata(name="segment_span_mean_pct", unit="%", type=ResultType.FLOAT, higher_is_better=False),
+            ColumnMetadata(name="segment_span_max_pct", unit="%", type=ResultType.FLOAT, higher_is_better=False),
         ]
 
 
@@ -167,6 +198,79 @@ def parse_index_gauge(metrics_text: str, metric: str, keyspace: str, index_name:
         ):
             return float(match.group("value"))
     return None
+
+
+def parse_index_gauge_series(metrics_text: str, metric: str, keyspace: str, index_name: str, label: str) -> dict[str, float]:
+    """Every sample of one gauge for one index, keyed by the value of *label*.
+
+    For the per-segment gauges, where one metric has a sample per segment ordinal. Empty when the
+    index has no samples, for the same reasons 'parse_index_gauge' returns None.
+    """
+    wanted_keyspace = keyspace.lower()
+    wanted_index = index_name.lower()
+    line_re = re.compile(_METRIC_LINE_RE_TEMPLATE.format(metric=re.escape(metric)), re.MULTILINE)
+    series = {}
+    for match in line_re.finditer(metrics_text):
+        labels = {m.group("name"): m.group("value") for m in _LABEL_RE.finditer(match.group("labels"))}
+        if (
+            labels.get("keyspace", "").lower() == wanted_keyspace
+            and labels.get("index_name", "").lower() == wanted_index
+            and label in labels
+        ):
+            series[labels[label]] = float(match.group("value"))
+    return series
+
+
+def parse_segment_layout(metrics_text: str, keyspace: str, index_name: str) -> list[tuple[int, float, float | None, float | None]]:
+    """The index's segments as (ordinal, live rows, sort min, sort max), by ordinal.
+
+    The bounds are None for an unordered index, which exports none.
+    """
+    docs = parse_index_gauge_series(metrics_text, SEGMENT_DOCS_METRIC, keyspace, index_name, "segment")
+    lows = parse_index_gauge_series(metrics_text, SEGMENT_SORT_MIN_METRIC, keyspace, index_name, "segment")
+    highs = parse_index_gauge_series(metrics_text, SEGMENT_SORT_MAX_METRIC, keyspace, index_name, "segment")
+    return [
+        (int(ordinal), docs[ordinal], lows.get(ordinal), highs.get(ordinal))
+        for ordinal in sorted(docs, key=int)
+    ]
+
+
+def segment_spans_pct(segments: list[tuple[int, float, float | None, float | None]]) -> list[float]:
+    """Each segment's span of the sort column as a percentage of the range every segment covers together.
+
+    A one-value range, or an unordered index, makes every span 0: there is nothing to prune by and
+    nothing the pruning could gain, which is the same thing from the query's point of view.
+    """
+    bounded = [(low, high) for _, _, low, high in segments if low is not None and high is not None]
+    if not bounded:
+        return [0.0 for _ in segments]
+    overall_low = min(low for low, _ in bounded)
+    overall_high = max(high for _, high in bounded)
+    overall = overall_high - overall_low
+    if overall <= 0:
+        return [0.0 for _ in segments]
+    return [
+        (round(100.0 * (high - low) / overall, 2) if low is not None and high is not None else 0.0)
+        for _, _, low, high in segments
+    ]
+
+
+def walk_per_query(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    """The per-query cost of the searches served between two scrapes of the walk totals.
+
+    *before* and *after* map metric names (SEARCHES_METRIC and the ones WALK_PER_QUERY_METRICS
+    names) to the scraped values. Returns the WALK_COLUMNS cells, or {} when no search was served
+    in between -- a phase whose queries never reached the index has no per-query cost to report,
+    and dividing by zero would say it was free.
+    """
+    searches = after.get(SEARCHES_METRIC, 0.0) - before.get(SEARCHES_METRIC, 0.0)
+    if searches <= 0:
+        return {}
+    cells = {SEARCHES_COLUMN: int(searches)}
+    for column, (metric, scale) in WALK_PER_QUERY_METRICS.items():
+        if metric in after and metric in before:
+            cells[column] = round(scale * (after[metric] - before[metric]) / searches, 3)
+    return cells
 
 
 class SubstringSearchTest(SearchPerformanceTest):
@@ -284,8 +388,71 @@ class SubstringSearchTest(SearchPerformanceTest):
             build_seconds = None  # nothing was built here, so there is no build time to report
         else:
             build_seconds = super()._build_index(record_count, max_index_wait, index_name=index_name, keyspace=keyspace)
+        # The index the query phases that follow will be priced against (see 'search_phase_end').
+        self._queried_index = (keyspace, index_name)
         self._report_index_size(keyspace, index_name, record_count)
         return build_seconds
+
+    def search_extra_columns(self):
+        return super().search_extra_columns() + WALK_COLUMNS
+
+    def search_phase_begin(self):
+        return self._scrape_walk_totals()
+
+    def search_phase_end(self, phase) -> dict:
+        """What one query of the phase cost the index, from the walk totals before and after it.
+
+        The totals count every search the index served, so they also see whatever else queried it
+        meanwhile -- nothing does in this flow. A scrape that failed on either side leaves the cells
+        empty rather than reporting a delta against nothing.
+        """
+        after = self._scrape_walk_totals()
+        if phase is None or after is None:
+            return {}
+        cells = walk_per_query(phase, after)
+        if cells:
+            self.log.info(
+                "Index work per query: %s",
+                ", ".join(f"{column}={value}" for column, value in cells.items()),
+            )
+        else:
+            self.log.warning("The index served no searches during the phase; no per-query cost to report")
+        return cells
+
+    def _scrape_walk_totals(self) -> dict[str, float] | None:
+        """The index's search totals now, or None if there is no index or the scrape failed."""
+        queried = getattr(self, "_queried_index", None)
+        if queried is None:
+            return None
+        keyspace, index_name = queried
+        try:
+            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
+        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
+            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+            return None
+        totals = {}
+        for metric in [SEARCHES_METRIC] + [metric for metric, _ in WALK_PER_QUERY_METRICS.values()]:
+            value = parse_index_gauge(metrics_text, metric, keyspace, index_name)
+            if value is not None:
+                totals[metric] = value
+        return totals
+
+    def _log_segment_layout(self, index_name, segments, spans_pct):
+        """One line per segment: what an ordered search sees when it decides what to skip."""
+        self.log.info(
+            "Index '%s' layout: %d segments, mean span %.1f%% of the sort range, widest %.1f%%",
+            index_name,
+            len(segments),
+            sum(spans_pct) / len(spans_pct) if spans_pct else 0.0,
+            max(spans_pct, default=0.0),
+        )
+        for (ordinal, docs, low, high), span in list(zip(segments, spans_pct))[:SEGMENT_LAYOUT_LOG_ROWS]:
+            if low is None or high is None:
+                self.log.info("  segment %3d: %9d rows", ordinal, int(docs))
+            else:
+                self.log.info("  segment %3d: %9d rows, sort %s..%s (%.1f%%)", ordinal, int(docs), f"{low:.0f}", f"{high:.0f}", span)
+        if len(segments) > SEGMENT_LAYOUT_LOG_ROWS:
+            self.log.info("  ... and %d more", len(segments) - SEGMENT_LAYOUT_LOG_ROWS)
 
     def _wait_for_index_count(self, keyspace, index_name, record_count, timeout):
         """Wait until the index holds every row that was loaded.
@@ -376,6 +543,10 @@ class SubstringSearchTest(SearchPerformanceTest):
             return
         segments = parse_index_gauge(metrics_text, SEGMENT_COUNT_METRIC, keyspace, index_name)
         bytes_per_name = round(size_bytes / record_count, 2) if record_count else 0.0
+        layout = parse_segment_layout(metrics_text, keyspace, index_name)
+        spans_pct = segment_spans_pct(layout)
+        if layout:
+            self._log_segment_layout(index_name, layout, spans_pct)
 
         self.log.info(
             "Index '%s': %d bytes for %d names (%.2f bytes/name), %s segments",
@@ -396,6 +567,11 @@ class SubstringSearchTest(SearchPerformanceTest):
         result_table.add_result(
             column="segment_count", row=row_key, value=int(segments) if segments is not None else 0, status=Status.UNSET
         )
+        if spans_pct:
+            result_table.add_result(
+                column="segment_span_mean_pct", row=row_key, value=round(sum(spans_pct) / len(spans_pct), 2), status=Status.UNSET
+            )
+            result_table.add_result(column="segment_span_max_pct", row=row_key, value=max(spans_pct), status=Status.UNSET)
         submit_results_to_argus(self.test_config.argus_client(), result_table)
 
     def test_substring_search(self):
