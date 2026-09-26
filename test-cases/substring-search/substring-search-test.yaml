@@ -62,7 +62,7 @@ n_monitor_nodes: 1
 # over the newest vector-store AMI for the architecture.
 # The value is handed to 'git remote add' on the node, so it is a URL, not 'owner/name'.
 vector_store_source_repo: 'https://github.com/m-szymon/vector-store.git'
-vector_store_source_ref: 'substring-index-stage2'
+vector_store_source_ref: 'substring-index-stage3'
 
 # Scylla also needs a build with substring_index support and there is no released one, but it does
 # not need a custom AMI: 'unified_package' takes the URL of a relocatable package, and SCT then
