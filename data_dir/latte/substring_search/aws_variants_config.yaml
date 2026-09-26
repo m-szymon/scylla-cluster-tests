@@ -1,0 +1,78 @@
+# The one-run plan for stage 2 and 3 on AWS: several index variants over a single 10M load, each
+# answering one question, every query row reported once per variant.
+#
+# Used with test-cases/substring-search/substring-search-test.yaml and
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_variants_config.yaml
+#
+# A variant is an index created before the load with extra WITH OPTIONS entries; ScyllaDB stores
+# the poc_option_N placeholders and vector-store gives them meaning (docs/dev/substring in that
+# repo). At the time of writing:
+#   poc_option_1  primary id as a FAST column      (measured, not worth it; not run again)
+#   poc_option_2  segment cap in rows: the range-aware merge policy, P3a
+#   poc_option_3  (reserved for the backfill rewrite, P3b)
+#   poc_option_4  verify a long keyword's candidates in posting order (the pre-two-pass walk)
+#
+# Budget: provisioning ~18 min, the load ~33 min (all variants ingest the same CDC stream), then
+# ~21 min per variant (six two-minute phases plus HDR processing), teardown ~5 min. Four variants
+# come to about 2:20; each one added is another 21 minutes and another index on the node's 8 GB
+# (a 10M index is ~350 MB).
+datasets:
+  - name: names_10M
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      # Tantivy's default merge policy: the baseline every other variant is read against.
+      - label: default
+      # P3a at two caps. The 100k cap gave every segment exactly one shard (1% of the range) and
+      # the deep page the cost of page 1; the 250k cap is the same at a third of the segment count.
+      - label: p3a_100k
+        options: {poc_option_2: '100000'}
+      - label: p3a_250k
+        options: {poc_option_2: '250000'}
+      # The 100k cap with the old verification walk: the only row that differs from p3a_100k is
+      # the 4-char set, and the difference is what the two-pass walk is worth.
+      - label: p3a_100k_inorder
+        options: {poc_option_2: '100000', poc_option_4: 'true'}
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            concurrency: 128
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char4
+            concurrency: 64
+            rate: 10000
+
+  # --- backfill (stage 3), to be enabled once the rewrite pass exists ------------------------
+  # The same corpus with the index created AFTER the load: built by a full scan in token order,
+  # so every segment spans the whole range and nothing prunes. This is what a customer adding an
+  # index to an existing table gets, and what P3b has to repair. Two variants: left as built, and
+  # with the rewrite pass on (poc_option_3). Adds a second load (~33 min) and the build.
+  # - name: names_10M_backfill
+  #   index_variants:
+  #     - label: wide
+  #     - label: rewrite
+  #       options: {poc_option_3: 'true'}
+  #   ...

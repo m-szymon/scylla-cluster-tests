@@ -263,7 +263,7 @@ def test_variants_are_validated_and_normalised():
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a"}, {"label": "a"}]}, "used twice"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": 1}}]}, "string values"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "it's"}}]}, "only letters"),
-    ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "1", "j": "2"}}]}, "one extra option"),
+    ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": "1", "j": "2", "i": "3"}}]}, "up to 2 extra options"),
 ])
 def test_bad_variants_are_plan_errors(dataset, error):
     with pytest.raises(ValueError, match=error):
@@ -273,8 +273,12 @@ def test_bad_variants_are_plan_errors(dataset, error):
 def test_the_option_params_are_the_ones_the_script_takes(script_source):
     assert index_option_params({"poc_option_1": "true"}) == '-P extra_option_name=\\"poc_option_1\\" -P extra_option_value=\\"true\\" '
     assert index_option_params({}) == ""
-    assert 'param!("extra_option_name"' in script_source
-    assert 'param!("extra_option_value"' in script_source
+    assert index_option_params({"poc_option_4": "true", "poc_option_2": "100000"}) == (
+        '-P extra_option_name=\\"poc_option_2\\" -P extra_option_value=\\"100000\\" '
+        '-P extra_option2_name=\\"poc_option_4\\" -P extra_option2_value=\\"true\\" '
+    )
+    for param in ("extra_option_name", "extra_option_value", "extra_option2_name", "extra_option2_value"):
+        assert f'param!("{param}"' in script_source
 
 
 def test_the_variant_label_ends_the_row_label():

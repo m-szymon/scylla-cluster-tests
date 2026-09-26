@@ -66,13 +66,15 @@ const CASE_SENSITIVE = latte::param!("case_sensitive", true);
 //              Set it and the table gains a bigint column of that name, carrying the third field
 //              of the names file, and the index is created to order by it.
 const ORDER_BY = latte::param!("order_by", "");
-//   extra_option_name / extra_option_value
-//              one more entry for the WITH OPTIONS map, for a knob the index node reads and this
+//   extra_option_name / extra_option_value, extra_option2_name / extra_option2_value
+//              up to two more entries for the WITH OPTIONS map, for a knob the index node reads and this
 //              script has no opinion about (the poc_option_N placeholders). Two plain params rather
 //              than a quoted fragment: latte splices a -P value into the script as a literal, so a
 //              quote inside it breaks the parse. ScyllaDB rejects a name it does not know.
 const EXTRA_OPTION_NAME = latte::param!("extra_option_name", "");
 const EXTRA_OPTION_VALUE = latte::param!("extra_option_value", "");
+const EXTRA_OPTION2_NAME = latte::param!("extra_option2_name", "");
+const EXTRA_OPTION2_VALUE = latte::param!("extra_option2_value", "");
 
 // Search shape. Both are meaningless without ORDER_BY and are rejected below rather than silently
 // ignored, since a run that measured the unordered query while its report said 'ordered' would be
@@ -125,6 +127,7 @@ fn index_options_clause() {
     if MAX_GRAM > 0 { opts += `'max_gram': '${MAX_GRAM}', `; }
     if is_ordered() { opts += `'order_by': '${ORDER_BY}', `; }
     if EXTRA_OPTION_NAME != "" { opts += `'${EXTRA_OPTION_NAME}': '${EXTRA_OPTION_VALUE}', `; }
+    if EXTRA_OPTION2_NAME != "" { opts += `'${EXTRA_OPTION2_NAME}': '${EXTRA_OPTION2_VALUE}', `; }
     opts += `'case_sensitive': '${CASE_SENSITIVE}'`;
     ` WITH OPTIONS = {${opts}}`
 }

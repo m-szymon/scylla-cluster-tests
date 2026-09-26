@@ -114,8 +114,7 @@ _LABEL_RE = re.compile(r'(?P<name>\w+)="(?P<value>[^"]*)"')
 WITH_INDEX_PARAM = "with_index"
 # The '-P' names carrying one extra WITH OPTIONS entry, name and value apart: latte splices a
 # value into the script as a literal, so a quoted fragment would not parse.
-EXTRA_OPTION_NAME_PARAM = "extra_option_name"
-EXTRA_OPTION_VALUE_PARAM = "extra_option_value"
+EXTRA_OPTION_PARAMS = (("extra_option_name", "extra_option_value"), ("extra_option2_name", "extra_option2_value"))
 
 # A dataset may ask for several indexes over the one load, differing only in their options:
 #
@@ -257,20 +256,24 @@ def checked_index_variants(dataset: dict) -> list[dict]:
 
 
 def index_option_params(options: dict) -> str:
-    """The '-P' flags carrying a variant's extra index option to substring.rn, or "" for none.
+    """The '-P' flags carrying a variant's extra index options to substring.rn, or "" for none.
 
-    One option per variant for now, which is what the script takes; the value and name are plain
+    As many options per variant as the script has slots for; the values and names are plain
     words, since they travel through a shell command line and into a rune literal.
     """
     if not options:
         return ""
-    if len(options) > 1:
-        raise ValueError(f"An index variant can set one extra option, not {sorted(options)}")
-    ((name, value),) = options.items()
-    for text in (name, value):
-        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", text):
-            raise ValueError(f"Index option {name!r}={value!r}: only letters, digits, '_', '.' and '-' can be passed")
-    return f'-P {EXTRA_OPTION_NAME_PARAM}=\\"{name}\\" -P {EXTRA_OPTION_VALUE_PARAM}=\\"{value}\\" '
+    if len(options) > len(EXTRA_OPTION_PARAMS):
+        raise ValueError(
+            f"An index variant can set up to {len(EXTRA_OPTION_PARAMS)} extra options, not {sorted(options)}"
+        )
+    flags = ""
+    for (name_param, value_param), (name, value) in zip(EXTRA_OPTION_PARAMS, sorted(options.items())):
+        for text in (name, value):
+            if not re.fullmatch(r"[A-Za-z0-9_.\-]+", text):
+                raise ValueError(f"Index option {name!r}={value!r}: only letters, digits, '_', '.' and '-' can be passed")
+        flags += f'-P {name_param}=\\"{name}\\" -P {value_param}=\\"{value}\\" '
+    return flags
 
 
 def parse_index_gauge_series(metrics_text: str, metric: str, keyspace: str, index_name: str, label: str) -> dict[str, float]:
