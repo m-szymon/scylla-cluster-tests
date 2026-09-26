@@ -93,14 +93,18 @@ datasets:
           - set: char2
             window: 0.5
 
-  # The same corpus and the same sort values, written in a different order. Sequential arrival lets
-  # each index segment hold one contiguous slice of the range, so an ordered query skips whole
-  # segments on their bounds; shuffled arrival leaves every segment spanning everything, nothing
-  # prunes, and the walk visits every match. Locally this measures nothing -- 3000 names fit in one
-  # segment -- and is here so the plan shape and the generator flag are exercised. The comparison
-  # is meant for the AWS plan.
+  # The backfill case: the index is created AFTER the load, so vector-store builds it by a full
+  # scan in token order and every segment spans the whole sort range whatever order the rows were
+  # written in (this corpus is shuffled on top, which changes nothing here). Two variants, both
+  # created on the loaded table: left as built, and with the range-aware merge policy plus the
+  # rewrite of wide segments (poc_option_2 and poc_option_3 as vector-store reads them), which
+  # should end with narrow, capped segments. Locally this exercises the after-load variant rounds
+  # and the rewrite; the measurement is the AWS plan's.
   - name: local_shuffled
-    index_during_load: true
+    index_variants:
+      - label: wide
+      - label: rewrite
+        options: {poc_option_2: '500', poc_option_3: 'true'}
     max_index_wait_secs: 300
     defaults:
       limit: 20

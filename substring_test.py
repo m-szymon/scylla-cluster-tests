@@ -83,6 +83,11 @@ SEGMENT_SORT_MAX_METRIC = "substring_segment_sort_max"
 # over a query phase, divided by the searches served in it, says what one query cost the index --
 # which is what tells a slow walk from a wide-segment layout when the latency alone cannot.
 SEARCHES_METRIC = "substring_search_total"
+# P3b progress: an index with the rewrite on is not settled until every range has been moved.
+REWRITE_RANGES_TOTAL_METRIC = "substring_rewrite_ranges_total"
+REWRITE_RANGES_DONE_METRIC = "substring_rewrite_ranges_done"
+REWRITE_DOCS_METRIC = "substring_rewrite_docs_total"
+L0_DOCS_METRIC = "substring_l0_docs"
 # Column of the search latency table -> (metric, unit scale applied to the per-query value).
 WALK_PER_QUERY_METRICS = {
     "walk_us_per_query": ("substring_search_walk_seconds_total", 1e6),
@@ -128,8 +133,9 @@ EXTRA_OPTION_PARAMS = (("extra_option_name", "extra_option_value"), ("extra_opti
 # them for every query and the choice is not by name, so each round of the query sets first finds
 # out which index is serving (a short probe, then a look at which one's search total moved), labels
 # its rows with that variant, and drops the index afterwards so the next round reaches another.
-# Needs 'index_during_load': a variant built by a full scan after the load would have a different
-# layout from one fed by CDC, and the comparison would be about that instead.
+# With 'index_during_load' the variants ingest the same CDC stream; without it they are created
+# after the load, one after another, and each is built by vector-store's full scan -- the backfill
+# case, whose wide segments are what the rewrite option exists for.
 INDEX_VARIANTS_KEY = "index_variants"
 SERVED_INDEX_PROBE_DURATION = "5s"
 
@@ -177,6 +183,11 @@ class SubstringIndexSizeResult(StaticGenericResultTable):
             # load. The ingestion cost of an index option -- a merge policy that rewrites its tail
             # on every commit, say -- shows up here and nowhere else.
             ColumnMetadata(name="catch_up_secs", unit="s", type=ResultType.FLOAT, higher_is_better=False),
+            # The rewrite of wide segments (P3b): rows it found in wide segments when it planned,
+            # and the ranges it moved them in. Zero for an index without the option, or one that
+            # never needed it.
+            ColumnMetadata(name="l0_rows", unit="rows", type=ResultType.INTEGER, higher_is_better=False),
+            ColumnMetadata(name="rewrite_ranges", unit="", type=ResultType.INTEGER),
         ]
 
 
@@ -238,8 +249,6 @@ def checked_index_variants(dataset: dict) -> list[dict]:
     variants = dataset.get(INDEX_VARIANTS_KEY) or []
     if not variants:
         return []
-    if not dataset.get("index_during_load"):
-        raise ValueError(f"Dataset {dataset.get('name')!r}: '{INDEX_VARIANTS_KEY}' needs 'index_during_load: true'")
     checked = []
     for variant in variants:
         if not isinstance(variant, dict) or "label" not in variant:
@@ -493,6 +502,23 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self._wait_for_index_settled(keyspace, name, max_index_wait)
                 self._report_index_size(keyspace, name, record_count, catch_up_secs=catch_up.get(name))
             build_seconds = None  # nothing was built here, so there is no build time to report
+        elif self._variants:
+            # The backfill case: every variant is created now, on the loaded table, and built by
+            # vector-store's full scan. 'catch_up_secs' is then the build time, from the moment
+            # the last CREATE INDEX was issued.
+            self._ingesting_index_name = index_name
+            self._live_variants = {}
+            for variant in self._variants:
+                name = f"{index_name}_{variant['label']}"
+                self._create_index_for_ingestion(name, index_option_params(variant["options"]))
+                self._live_variants[name] = variant["label"]
+            self._load_finished_at = time.monotonic()
+            names = list(self._live_variants)
+            catch_up = self._wait_for_indexes_count(keyspace, names, record_count, max_index_wait)
+            for name in names:
+                self._wait_for_index_settled(keyspace, name, max_index_wait)
+                self._report_index_size(keyspace, name, record_count, catch_up_secs=catch_up.get(name))
+            build_seconds = None  # per variant, in the size row, rather than one build time
         else:
             build_seconds = super()._build_index(record_count, max_index_wait, index_name=index_name, keyspace=keyspace)
             self._report_index_size(keyspace, index_name, record_count)
@@ -736,7 +762,20 @@ class SubstringSearchTest(SearchPerformanceTest):
                     "No '%s' sample for '%s'; not waiting for it to settle", SEGMENT_COUNT_METRIC, index_name
                 )
                 return
-            stable = stable + 1 if segments == previous else 0
+            # A rewrite in progress moves a range per tick and changes the layout every time; the
+            # index is settled only once it has finished (and the merges after it have stopped).
+            ranges_total = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_TOTAL_METRIC) or 0
+            ranges_done = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_DONE_METRIC) or 0
+            rewriting = ranges_done < ranges_total
+            if rewriting:
+                self.log.info(
+                    "Index '%s' rewriting wide segments: %d of %d ranges moved, %d segments",
+                    index_name,
+                    int(ranges_done),
+                    int(ranges_total),
+                    int(segments),
+                )
+            stable = stable + 1 if segments == previous and not rewriting else 0
             previous = segments
             if stable >= SETTLE_STABLE_POLLS:
                 self.log.info("Index '%s' settled at %d segments", index_name, int(segments))
@@ -805,6 +844,19 @@ class SubstringSearchTest(SearchPerformanceTest):
             result_table.add_result(column="segment_span_max_pct", row=row_key, value=max(spans_pct), status=Status.UNSET)
         if catch_up_secs is not None:
             result_table.add_result(column="catch_up_secs", row=row_key, value=catch_up_secs, status=Status.UNSET)
+        l0_rows = parse_index_gauge(metrics_text, L0_DOCS_METRIC, keyspace, index_name)
+        rewrite_ranges = parse_index_gauge(metrics_text, REWRITE_RANGES_TOTAL_METRIC, keyspace, index_name)
+        if l0_rows is not None:
+            result_table.add_result(column="l0_rows", row=row_key, value=int(l0_rows), status=Status.UNSET)
+        if rewrite_ranges is not None:
+            result_table.add_result(column="rewrite_ranges", row=row_key, value=int(rewrite_ranges), status=Status.UNSET)
+            if rewrite_ranges:
+                self.log.info(
+                    "Index '%s': %d rows in wide segments were rewritten in %d ranges",
+                    index_name,
+                    int(l0_rows or 0),
+                    int(rewrite_ranges),
+                )
         submit_results_to_argus(self.test_config.argus_client(), result_table)
 
     def test_substring_search(self):

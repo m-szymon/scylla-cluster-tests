@@ -255,10 +255,11 @@ def test_variants_are_validated_and_normalised():
         {"label": "fast_id", "options": {"poc_option_1": "true"}},
     ]
     assert checked_index_variants({"name": "d"}) == []
+    # Without 'index_during_load' the variants are built after the load, by a full scan each.
+    assert checked_index_variants({"name": "d", "index_variants": [{"label": "wide"}]}) == [{"label": "wide", "options": {}}]
 
 
 @pytest.mark.parametrize("dataset,error", [
-    ({"name": "d", "index_variants": [{"label": "a"}]}, "index_during_load"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"options": {}}]}, "needs a 'label'"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a"}, {"label": "a"}]}, "used twice"),
     ({"name": "d", "index_during_load": True, "index_variants": [{"label": "a", "options": {"k": 1}}]}, "string values"),

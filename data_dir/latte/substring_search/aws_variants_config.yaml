@@ -9,13 +9,14 @@
 # repo). At the time of writing:
 #   poc_option_1  primary id as a FAST column      (measured, not worth it; not run again)
 #   poc_option_2  segment cap in rows: the range-aware merge policy, P3a
-#   poc_option_3  (reserved for the backfill rewrite, P3b)
+#   poc_option_3  rewrite wide segments into range-aligned ones (needs the cap): P3b
 #   poc_option_4  verify a long keyword's candidates in posting order (the pre-two-pass walk)
 #
 # Budget: provisioning ~18 min, the load ~33 min (all variants ingest the same CDC stream), then
 # ~21 min per variant (six two-minute phases plus HDR processing), teardown ~5 min. Four variants
 # come to about 2:20; each one added is another 21 minutes and another index on the node's 8 GB
-# (a 10M index is ~350 MB).
+# (a 10M index is ~350 MB). The backfill dataset below adds about 1:20, so the whole plan is
+# about 3:40 -- inside one Okta session, but start it early.
 datasets:
   - name: names_10M
     index_during_load: true
@@ -65,14 +66,42 @@ datasets:
             concurrency: 64
             rate: 10000
 
-  # --- backfill (stage 3), to be enabled once the rewrite pass exists ------------------------
-  # The same corpus with the index created AFTER the load: built by a full scan in token order,
+  # --- backfill (stage 3) ----------------------------------------------------------------------
+  # The same corpus with the indexes created AFTER the load: built by a full scan in token order,
   # so every segment spans the whole range and nothing prunes. This is what a customer adding an
-  # index to an existing table gets, and what P3b has to repair. Two variants: left as built, and
-  # with the rewrite pass on (poc_option_3). Adds a second load (~33 min) and the build.
-  # - name: names_10M_backfill
-  #   index_variants:
-  #     - label: wide
-  #     - label: rewrite
-  #       options: {poc_option_3: 'true'}
-  #   ...
+  # index to an existing table gets, and what P3b repairs. Two variants, both created on the
+  # loaded table: left as built, and with the cap plus the rewrite of wide segments. The size
+  # rows say what the build produced (span columns, 'l0_rows', 'rewrite_ranges') and what the
+  # rewrite cost ('catch_up_secs' is the build time here, rewrite included); the query rows say
+  # what it bought. Adds a second load (~33 min), the two builds and two rounds (~1:20 in all).
+  #
+  # The dataset directory is the sequential corpus under another name:
+  #   ln -s names_10M data_dir/latte/substring_search/names_10M_backfill
+  - name: names_10M_backfill
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      - label: wide
+      - label: rewrite
+        options: {poc_option_2: '100000', poc_option_3: 'true'}
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000

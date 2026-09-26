@@ -141,14 +141,17 @@ the first posting) and `column_opens_per_query` (columns opened for it), `page_r
 the number to read first: an ordered query that scans tens of thousands of postings for a page of
 20 is walking segments it could not skip, and that is a layout problem, not a query one.
 
-To compare two index configurations on the same layout, a dataset can declare `index_variants`
+To compare index configurations on the same data, a dataset can declare `index_variants`
 (each a `label` and optionally one extra option, e.g. `options: {poc_option_1: 'true'}`): every variant is created
 before the load and ingests the same CDC stream, then the step's query sets run once per variant,
 with `[label]` at the end of each row label. ScyllaDB decides which index answers a query and not
 by name, so each round starts with a five-second probe to find out which one is serving, and ends
 by dropping it so the next round reaches another. The size row (with `catch_up_secs`, how long after the
 load each index held every row -- the ingestion cost of its options), the layout and the per-query
-walk columns are reported per variant. `poc_option_1..4` are placeholders ScyllaDB stores and passes
+walk columns are reported per variant. Without `index_during_load` the variants are created after the
+load instead, each built by vector-store's full scan: the backfill case, where `catch_up_secs` is the
+build time and the `l0_rows` / `rewrite_ranges` columns say what the rewrite of wide segments found and
+did. The settle wait covers a rewrite in progress. `poc_option_1..4` are placeholders ScyllaDB stores and passes
 through; what they mean is vector-store's business and is documented there (at the time of
 writing: `poc_option_1` keeps the primary id as a column, `poc_option_2` caps segment size and
 switches on the range-aware merge policy).
