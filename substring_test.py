@@ -468,13 +468,14 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._load_finished_at = time.monotonic()
         return loaded
 
-    def _create_index_for_ingestion(self, index_name, option_params=""):
-        """Create the index up front, so that rows are indexed as they are written.
+    def _create_index_for_ingestion(self, index_name, option_params="", when="before the load, to index while loading"):
+        """Create the index by itself, so that vector-store fills it: from the rows as they are
+        written when created before the load, by its own full scan when created after it.
 
         Only the index existing in the schema matters, not which statement created it: the index
         node picks it up and ingests the base table's CDC log either way.
         """
-        self.log.info("Creating index '%s' before the load, to index while loading", index_name)
+        self.log.info("Creating index '%s' %s", index_name, when)
         self._run_latte(
             f"latte schema {self.WORKLOAD.script} "
             f"-P {WITH_INDEX_PARAM}=true "
@@ -510,7 +511,9 @@ class SubstringSearchTest(SearchPerformanceTest):
             self._live_variants = {}
             for variant in self._variants:
                 name = f"{index_name}_{variant['label']}"
-                self._create_index_for_ingestion(name, index_option_params(variant["options"]))
+                self._create_index_for_ingestion(
+                    name, index_option_params(variant["options"]), when="on the loaded table, to build by full scan"
+                )
                 self._live_variants[name] = variant["label"]
             self._load_finished_at = time.monotonic()
             names = list(self._live_variants)

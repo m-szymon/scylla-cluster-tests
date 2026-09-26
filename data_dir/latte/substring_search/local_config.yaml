@@ -103,8 +103,11 @@ datasets:
   - name: local_shuffled
     index_variants:
       - label: wide
+      # A cap of 100 on 3000 rows: a segment is wide when it spans more than eight times its share
+      # of the rows, and at a cap of 500 a 490-row segment's share is a sixth, so nothing would
+      # ever count as wide. (At 10M rows and a 100k cap the share is 1%.)
       - label: rewrite
-        options: {poc_option_2: '500', poc_option_3: 'true'}
+        options: {poc_option_2: '100', poc_option_3: 'true'}
     max_index_wait_secs: 300
     defaults:
       limit: 20
