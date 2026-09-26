@@ -31,7 +31,13 @@ from sdcm.remote.docker_cmd_runner import DockerCmdRunner
 from sdcm.sct_config import simulated_racks_enabled
 from sdcm.sct_events.database import DatabaseLogEvent
 from sdcm.sct_events.filters import DbEventsFilter
-from sdcm.utils.docker_utils import get_docker_bridge_gateway, Container, ContainerManager, DockerException
+from sdcm.utils.docker_utils import (
+    get_docker_bridge_gateway,
+    running_in_podman,
+    Container,
+    ContainerManager,
+    DockerException,
+)
 from sdcm.utils.health_checker import check_nodes_status
 from sdcm.nemesis.utils.node_allocator import mark_new_nodes_as_running_nemesis
 from sdcm.utils.net import get_my_public_ip
@@ -47,6 +53,20 @@ LOGGER = logging.getLogger(__name__)
 
 class ScyllaDockerRequirementError(cluster.ScyllaRequirementError, DockerException):
     pass
+
+
+def container_engine_socket() -> str:
+    """The host path of the container engine's API socket, bound into every node container.
+
+    A node needs it to start sibling containers -- the loader runs latte that way. Docker's socket
+    is at a fixed system path; rootless podman's is per user, and the system path does not exist,
+    so binding it makes podman try to create /var/run/docker.sock as a mountpoint and fail with
+    'permission denied' before the first node starts. Inside the node the socket keeps the Docker
+    path either way, since that is where its docker client looks, and podman serves the Docker API.
+    """
+    if running_in_podman():
+        return f"/run/user/{os.getuid()}/podman/podman.sock"
+    return "/var/run/docker.sock"
 
 
 class NodeContainerMixin:
@@ -67,7 +87,7 @@ class NodeContainerMixin:
 
     def node_container_run_args(self, seed_ip):
         volumes = {
-            "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+            container_engine_socket(): {"bind": "/var/run/docker.sock", "mode": "rw"},
         }
 
         smp = 1
@@ -806,6 +826,13 @@ class DockerLoaderNode(cluster.BaseNode):
         pass
 
     def update_repo_cache(self):
+        pass
+
+    def do_default_installations(self):
+        # This node is the SCT runner itself, so there is nothing to provision: its image already
+        # ships what the base class would install. Installing anyway means running 'sudo apt-get'
+        # inside the runner, which under rootless podman fails outright -- sudo cannot read
+        # /etc/sudoers in a --userns=keep-id container -- and retries for minutes before it does.
         pass
 
     def _refresh_instance_state(self):

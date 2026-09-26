@@ -159,13 +159,14 @@ user_prefix: 'substring-search'
 # from a Scylla AMI instead.
 
 # Clean up after ourselves: there is no Jenkins stage behind a local run to destroy the resources,
-# so without this every run leaves its AWS instances up. 'keep-on-failure' rather than 'destroy' so
-# a failed run stays open for inspection -- remember to destroy it by hand afterwards.
+# so without this every run leaves its AWS instances up. 'destroy' on every node type, failure
+# included: the counters and the hdr files a failed round leaves are saved by the run's logs, and
+# a run that dies with the runner is cleaned by 'hydra clean-resources --test-id' afterwards.
 execute_post_behavior: true
-post_behavior_db_nodes: 'keep-on-failure'
-post_behavior_loader_nodes: 'keep-on-failure'
-post_behavior_monitor_nodes: 'keep-on-failure'
-post_behavior_vector_store_nodes: 'keep-on-failure'
+post_behavior_db_nodes: 'destroy'
+post_behavior_loader_nodes: 'destroy'
+post_behavior_monitor_nodes: 'destroy'
+post_behavior_vector_store_nodes: 'destroy'
 
 # The dataset and query plan. Resolved relative to the SCT root by resolve_test_config_path() in
 # search_perf_test.py, which also accepts a full 's3://bucket/key' URL:

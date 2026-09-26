@@ -154,7 +154,9 @@ if [[ -n "$JENKINS_URL" || -n "$BUILD_TAG" || -n "$GITHUB_ACTIONS" ]]; then
     echo "Running on Build Server..."
     HOST_NAME=`hostname`
 else
-    TTY_STDIN="-it"
+    # Only when there is a terminal to attach: a developer running hydra from a script or in the
+    # background has none, and docker refuses '-t' then ("the input device is not a TTY").
+    [[ -t 0 ]] && TTY_STDIN="-it"
     TPUT_OPTIONS=""
     [[ -z "$TERM" || "$TERM" == 'dumb' ]] && TPUT_OPTIONS="-T xterm-256color"
     TERM_SET_SIZE="export COLUMNS=`tput $TPUT_OPTIONS cols`; export LINES=`tput $TPUT_OPTIONS lines`;"
