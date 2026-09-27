@@ -33,6 +33,11 @@ query sets below are chosen by measured frequency rather than by hand:
 ``char2``   two characters, the typical search-box query.
 ``char4``   four characters, longer than the default ``max_gram`` of 3, so the index intersects
             three-character grams and verifies each candidate against the stored name.
+``char8``, ``char16``, ``char32``
+            longer keywords, up to the 32-character limit of both names and keywords. Only
+            written with ``--long-names``, which gives a tenth of the names a length of 11 to 32
+            characters (the plain corpus stops at 10); each of these keywords matches few names,
+            so together with a deep page they are the rare-long-keyword case.
 ``latin``   Latin substrings, which a case-insensitive index has to fold on both sides.
 ``miss``    keywords no name contains: the cost of an empty answer.
 
@@ -86,9 +91,33 @@ P_LATIN_NAME = 0.15  # Latin word (+ digits)
 # the rest: digits only
 
 MAX_NAME_CHARS = 32
+# With --long-names, this share of the names is 11 to 32 characters long, built from the same
+# pools, so that keywords of 8, 16 and 32 characters exist to search for.
+P_LONG_NAME = 0.10
 
 
-def _make_name(rng: random.Random) -> str:
+def _make_long_name(rng: random.Random) -> str:
+    """A name of 11 to 32 characters: words, person names and prefixes run together."""
+    target = rng.randint(11, MAX_NAME_CHARS)
+    parts = []
+    length = 0
+    while length < target:
+        kind = rng.random()
+        if kind < 0.4:
+            part = rng.choice(PREFIXES) + rng.choice(WORDS)
+        elif kind < 0.8:
+            part = rng.choice(SURNAMES) + rng.choice(GIVEN) + rng.choice(GIVEN)
+        else:
+            part = rng.choice(LATIN)
+        parts.append(part)
+        length += len(part)
+    return "".join(parts)[:target]
+
+
+def _make_name(rng: random.Random, long_names: bool = False) -> str:
+    # Drawn first and only when asked for, so a corpus without long names is unchanged by the flag.
+    if long_names and rng.random() < P_LONG_NAME:
+        return _make_long_name(rng)
     roll = rng.random()
     if roll < P_WORD_NAME:
         name = rng.choice(WORDS)
@@ -111,14 +140,16 @@ def _make_name(rng: random.Random) -> str:
     return name[:MAX_NAME_CHARS]
 
 
-def _generate_names(count: int, seed: int, sort_order: str) -> list[tuple[str, str, int]]:
+def _generate_names(
+    count: int, seed: int, sort_order: str, long_names: bool = False
+) -> list[tuple[str, str, int]]:
     """The corpus, in the order it is written: id, name, and the value an ordered index sorts by.
 
     The sort values are always 0..count-1, so both orders index the same values; `shuffled` only
     changes which row carries which, and so how wide a segment's span of them ends up.
     """
     rng = random.Random(seed)
-    rows = [(f"u{i:09d}", _make_name(rng)) for i in range(count)]
+    rows = [(f"u{i:09d}", _make_name(rng, long_names)) for i in range(count)]
     sort_values = list(range(count))
     if sort_order == "shuffled":
         # Its own generator, so that a corpus's names do not change when its sort order does: the
@@ -149,6 +180,25 @@ def _pick_keywords(counts: Counter, sampled: int, low: float, high: float, wante
     return [kw for kw, _ in picked[:wanted]]
 
 
+def _long_keywords(names: list[tuple[str, str, int]], sample: int, length: int, wanted: int) -> list[str]:
+    """`wanted` keywords of `length` characters, each the middle of a different long name, the
+    names spread evenly over the sample so that the keywords sit all over the sort range. Each
+    matches the name it came from and rarely any other: the rare long keyword."""
+    long_names = [name for _, name, _sort_value in names[:sample] if len(name) >= length]
+    if not long_names:
+        return []
+    step = max(1, len(long_names) // wanted)
+    picked = []
+    for name in long_names[::step]:
+        start = (len(name) - length) // 2
+        keyword = name[start : start + length]
+        if keyword not in picked:
+            picked.append(keyword)
+        if len(picked) == wanted:
+            break
+    return picked
+
+
 def _latin_keywords(counts: Counter, wanted: int) -> list[str]:
     picked = [kw for kw, _ in counts.most_common() if kw.isascii() and kw.isalpha()]
     return picked[:wanted]
@@ -167,11 +217,18 @@ def _exact_matches(names: list[tuple[str, str, int]], keyword: str, cap: int) ->
 
 
 def generate(
-    dataset: str, names_count: int, shards: int, out_root: str, seed: int, qrels_cap: int, sort_order: str
+    dataset: str,
+    names_count: int,
+    shards: int,
+    out_root: str,
+    seed: int,
+    qrels_cap: int,
+    sort_order: str,
+    long_names: bool = False,
 ) -> None:
     ds_dir = os.path.join(out_root, dataset)
     print(f"generating {names_count} names into {ds_dir} ({shards} shard(s)), sort order {sort_order}")
-    names = _generate_names(names_count, seed, sort_order)
+    names = _generate_names(names_count, seed, sort_order, long_names)
 
     if shards > 1:
         per_shard = (names_count + shards - 1) // shards
@@ -199,6 +256,8 @@ def generate(
         # Four characters: past max_gram, so the index has to verify its candidates.
         "char4": _pick_keywords(counts4, sample, 0.0, 0.01, 10),
         "latin": _latin_keywords(_substring_counts(names, 3, sample), 10),
+        # Long keywords, each from a different long name and matching few names besides it.
+        **({f"char{length}": _long_keywords(names, sample, length, 10) for length in (8, 16, 32)} if long_names else {}),
         # Keywords no generated name can contain: none of the pools hold these characters.
         "miss": ["㊙㊗", "ΩΨΔ", "zzqx"],
     }
@@ -248,6 +307,11 @@ def main() -> None:
         help="skip ground truth for a query set whose keyword matches more names than this; 0 disables it (default: 50)",
     )
     parser.add_argument(
+        "--long-names",
+        action="store_true",
+        help="give a tenth of the names 11 to 32 characters and write the char8/char16/char32 query sets",
+    )
+    parser.add_argument(
         "--sort-order",
         choices=("sequential", "shuffled"),
         default="sequential",
@@ -255,7 +319,9 @@ def main() -> None:
         "case for segment pruning (default: sequential)",
     )
     args = parser.parse_args()
-    generate(args.dataset, args.names, args.shards, args.out, args.seed, args.qrels_cap, args.sort_order)
+    generate(
+        args.dataset, args.names, args.shards, args.out, args.seed, args.qrels_cap, args.sort_order, args.long_names
+    )
 
 
 if __name__ == "__main__":

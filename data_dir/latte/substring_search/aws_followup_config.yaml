@@ -1,0 +1,78 @@
+# The follow-up to the one-run plan (aws_variants_config.yaml, run 2026-09-27): the two things that
+# run left open, on a corpus a tenth of whose names are 11 to 32 characters long
+# (generate_local_dataset.py --long-names), so that keywords of 8, 16 and 32 characters exist.
+#
+# Used with test-cases/substring-search/substring-search-test.yaml and
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_followup_config.yaml
+#
+#   1. Keyword length 1 to 32 on the capped index: the short sets as the baseline within this run,
+#      then 8, 16 and 32 characters on page 1, and 8 characters on a deep page -- the rare long
+#      keyword that has to open many segments to fill a page, the one shape the design does not
+#      argue away.
+#   2. The rewrite of an index created after the load, with ranges bounded to a cap's worth of
+#      the key space (vector-store a6cfcf7), which the first run's loop was fixed by: does it
+#      finish in one pass and settle, and what does the settled index answer at.
+#
+# Budget: provisioning ~20 min, load ~33 min, one round of eight phases ~27 min, second load
+# ~33 min, build + rewrite ~10 min, one round of three phases ~11 min, teardown ~5 min: ~2:20.
+#
+# The backfill dataset directory is the same corpus under another name:
+#   ln -s names_10M_long data_dir/latte/substring_search/names_10M_long_backfill
+datasets:
+  - name: names_10M_long
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      - label: p3a_100k
+        options: {poc_option_2: '100000'}
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 64
+      rate: 10000
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            ordered: true
+          - set: char2
+            ordered: true
+            window: 0.5
+          - set: char1
+            ordered: true
+          - set: char4
+            ordered: true
+          - set: char8
+            ordered: true
+          - set: char16
+            ordered: true
+          - set: char32
+            ordered: true
+          - set: char8
+            ordered: true
+            window: 0.5
+
+  - name: names_10M_long_backfill
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      - label: rewrite
+        options: {poc_option_2: '100000', poc_option_3: 'true'}
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 64
+      rate: 10000
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            ordered: true
+          - set: char2
+            ordered: true
+            window: 0.5
+          - set: char1
+            ordered: true

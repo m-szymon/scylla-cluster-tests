@@ -92,6 +92,17 @@ datasets:
           # because it is a different restriction path from the ordered one.
           - set: char2
             window: 0.5
+          # Keywords past max_gram, up to the 32-character limit (the local corpora are generated
+          # with --long-names). Each matches few names; qrels on the two longest keep the
+          # intersection-and-verify path honest for the longest keywords the index will see.
+          - set: char8
+            ordered: true
+          - set: char16
+            ordered: true
+            qrels: true
+          - set: char32
+            ordered: true
+            qrels: true
 
   # The backfill case: the index is created AFTER the load, so vector-store builds it by a full
   # scan in token order and every segment spans the whole sort range whatever order the rows were

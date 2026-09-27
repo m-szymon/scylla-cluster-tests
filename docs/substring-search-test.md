@@ -231,6 +231,15 @@ chosen by measured frequency, so `char1` really is the hot case and `char4` real
 gram intersection. To pull the corpus from S3 instead, upload the directory and add
 `base_url: s3://bucket/prefix` to the dataset in the plan.
 
+Those names are 2 to 10 characters long. The index is specified for names and keywords of up to
+32, so `--long-names` gives a tenth of the names a length of 11 to 32 characters (words, person
+names and prefixes run together) and writes three more query sets, `char8`, `char16` and
+`char32`, each keyword the middle of a different long name. Such a keyword matches the name it
+came from and rarely another, which with a deep page is the rare-long-keyword case: few matches,
+many segments to open before the page is full. `aws_followup_config.yaml` runs them against the
+`names_10M_long` corpus; the local corpora are generated with the option so the smoke run covers
+the sets too. Without the option the corpus is unchanged, byte for byte.
+
 ### A note on SSH
 
 The test case sets `ip_ssh_connections: 'public'`. SCT's default is `private`, which is correct when
