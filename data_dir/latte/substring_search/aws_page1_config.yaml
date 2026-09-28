@@ -1,0 +1,62 @@
+# A shorter cut of aws_config.yaml for measuring one index change at a time on the sequential
+# corpus, as two index variants over one load.
+#
+# Only the sequential corpus: the shuffled one measures segment pruning, which this change does not
+# touch. Six phases, so the run fits inside a two-hour AWS session. Rows to compare with the run of
+# 2026-09-25 06:17 UTC (first stage-2 build) and with stage 1:
+#
+#   char2 plain @10k        6,176 op/s   (stage 1: 9,704)
+#   char2 plain unthrottled 6,117        (stage 1: 9,610)
+#   char2 ordered @10k      5,974
+#   char2 ordered from 0.5  1,066
+#   char1 ordered @10k      5,774
+#   char4 plain @10k        5,003        (stage 1: 9,512; the verified path, which still reads)
+datasets:
+  - name: names_10M
+    index_during_load: true
+    # Two indexes over the one load, fed by the same CDC stream: Tantivy's default merge policy,
+    # and the range-aware one capped at 250k rows per segment (vector-store's meaning of
+    # poc_option_2 -- P3a). Every query row is reported once per variant, labelled '[default]' /
+    # '[p3a_250k]'. The size row's span columns say what each policy did to the layout; the
+    # per-query columns price it. The cap is a quarter of the 1M-row segments the default policy
+    # built, so a deep page should scan a quarter of the postings, and the tail should be one
+    # segment instead of six to eight.
+    # A second cap says how the deep page, the segment count and the index size move with it.
+    index_variants:
+      - label: default
+      - label: p3a_250k
+        options: {poc_option_2: '250000'}
+      - label: p3a_100k
+        options: {poc_option_2: '100000'}
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            concurrency: 128
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char4
+            concurrency: 64
+            rate: 10000
