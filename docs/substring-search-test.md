@@ -94,6 +94,12 @@ The price of ordering is an ordered row against a plain row from an index create
 `latte_schema_parameters`, which is what gives the table its sort column and the index its option.
 A plan asking for either without it is rejected before the run loads anything.
 
+Two more keys shape a query set. `order: asc` runs the ordered (or windowed) shape oldest
+first; the window then starts from the other end, and the row label says `asc`. `match: prefix`
+or `match: suffix` writes the pattern as `keyword%` or `%keyword` instead of `%keyword%`, which
+the index answers as containment of the keyword with the value's edge marked; the label gains
+the word. Ground truth is generated for containment only, so `qrels` goes with neither.
+
 ### Why `window` stands in for paging
 
 The point of the cursor the feature introduced is that page 50 costs what page 1 costs: a later page

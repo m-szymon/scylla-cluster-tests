@@ -53,6 +53,21 @@ from sdcm.utils.vector_store_index import index_build_columns
 SUBSTRING_BASE_DIR = "data_dir/latte/substring_search"
 
 
+def _checked_direction(value) -> str:
+    """The plan's 'order' key: 'desc' (the default) or 'asc'."""
+    if value not in ("desc", "asc"):
+        raise ValueError(f"'order' must be 'desc' or 'asc', got {value!r}")
+    return value
+
+
+def _checked_match(value) -> str:
+    """The plan's 'match' key: where the keyword has to occur, 'contains' (the default), 'prefix'
+    or 'suffix'."""
+    if value not in ("contains", "prefix", "suffix"):
+        raise ValueError(f"'match' must be 'contains', 'prefix' or 'suffix', got {value!r}")
+    return value
+
+
 def _checked_window(value) -> float:
     """Validate a plan's 'window': where in the order a windowed query starts, as a fraction.
 
@@ -377,10 +392,16 @@ class SubstringSearchTest(SearchPerformanceTest):
         """
         ordered = bool(query.get("ordered", False))
         window = _checked_window(query.get("window", 0.0))
+        direction = _checked_direction(query.get("order", "desc"))
+        match = _checked_match(query.get("match", "contains"))
         if window > 0.0:
             shape = f" ordered from {window:g}" if ordered else f" window from {window:g}"
         else:
             shape = " ordered" if ordered else ""
+        if direction == "asc" and (ordered or window > 0.0):
+            shape += " asc"
+        if match != "contains":
+            shape = f" {match}{shape}"
         # Which of the dataset's index variants answered; "" outside a variant round. Looked up
         # rather than read, since plan validation calls this on a stand-in for the test.
         variant = getattr(self, "_variant_label", "")
@@ -395,8 +416,11 @@ class SubstringSearchTest(SearchPerformanceTest):
         """
         ordered = bool(query.get("ordered", False))
         window = _checked_window(query.get("window", 0.0))
+        direction = _checked_direction(query.get("order", "desc"))
+        match = _checked_match(query.get("match", "contains"))
+        params = f"-P search_match={match} " if match != "contains" else ""
         if not ordered and window <= 0.0:
-            return ""
+            return params
         if not self._order_by:
             # Nothing downstream would fail: the index has no sort column, so substring.rn refuses
             # the shape -- but it refuses inside the loader, after the corpus is loaded and indexed.
@@ -404,7 +428,9 @@ class SubstringSearchTest(SearchPerformanceTest):
                 f"Query set {query.get('set')!r} asks for an ordered or windowed search, but "
                 f"'latte_schema_parameters' sets no 'order_by', so the index has nothing to order by"
             )
-        params = f"-P search_ordered={'true' if ordered else 'false'} "
+        params += f"-P search_ordered={'true' if ordered else 'false'} "
+        if direction != "desc":
+            params += f"-P search_direction={direction} "
         if window > 0.0:
             params += f"-P search_window_from={window} -P sort_value_count={record_count} "
         return params

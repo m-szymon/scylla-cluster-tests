@@ -15,6 +15,9 @@
 //!   ordered    WHERE col LIKE :pattern ORDER BY sort DESC LIMIT n
 //!   windowed   WHERE col LIKE :pattern AND sort < :cursor ORDER BY sort DESC LIMIT n
 //!
+//! 'search_direction' turns DESC into ASC (the window then starts from the other end and the
+//! bound flips to '>'); 'search_match' turns the '%keyword%' pattern into 'keyword%' or '%keyword'.
+//!
 //! The LIKE pattern is '%keyword%': the queries file holds bare keywords and this script wraps
 //! them, so that a plan can reuse one keyword file at several `search_limit` values. The pattern is
 //! bound rather than interpolated, which is also the path a real application takes.
@@ -87,6 +90,10 @@ const EXTRA_OPTION2_VALUE = latte::param!("extra_option2_value", "");
 //                       the cursor was introduced to keep flat.
 const SEARCH_ORDERED = latte::param!("search_ordered", false);
 const SEARCH_WINDOW_FROM = latte::param!("search_window_from", 0.0);
+// "desc" (the default) or "asc": the direction of an ordered or windowed search.
+const SEARCH_DIRECTION = latte::param!("search_direction", "desc");
+// "contains" (the default), "prefix" or "suffix": where the keyword has to occur.
+const SEARCH_MATCH = latte::param!("search_match", "contains");
 // The number of distinct sort values, needed to turn 'search_window_from' into a bound. The
 // generator numbers them 0..name_count-1, so this is the corpus size.
 const SORT_VALUE_COUNT = latte::param!("sort_value_count", 0);
@@ -175,9 +182,16 @@ fn join_path(dir, name) {
     if dir == "" || dir.ends_with("/") { dir + name } else { dir + "/" + name }
 }
 
-/// The '%keyword%' pattern a containment query is written with.
+/// The LIKE pattern for a keyword: '%keyword%' for containment, 'keyword%' for a prefix,
+/// '%keyword' for a suffix.
 fn contains_pattern(keyword) {
-    `%${keyword}%`
+    if SEARCH_MATCH == "prefix" {
+        `${keyword}%`
+    } else if SEARCH_MATCH == "suffix" {
+        `%${keyword}`
+    } else {
+        `%${keyword}%`
+    }
 }
 
 /// The share of the returned rows that really do contain the keyword.
@@ -319,20 +333,38 @@ pub async fn prepare(db) {
         if SEARCH_WINDOW_FROM > 0.0 && SORT_VALUE_COUNT <= 0 {
             return Err("search_window_from needs sort_value_count, the number of distinct sort values");
         }
+        if SEARCH_DIRECTION != "desc" && SEARCH_DIRECTION != "asc" {
+            return Err("search_direction must be 'desc' or 'asc'");
+        }
+        if SEARCH_MATCH != "contains" && SEARCH_MATCH != "prefix" && SEARCH_MATCH != "suffix" {
+            return Err("search_match must be 'contains', 'prefix' or 'suffix'");
+        }
+        let ascending = SEARCH_DIRECTION == "asc";
 
-        // The window bound. The generator numbers the sort values 0..count-1 and an ordered walk
-        // runs downwards, so a cursor at fraction f of the way down is (1 - f) * count: f = 0.5
-        // asks for the page that begins halfway through the order.
+        // The window bound. The generator numbers the sort values 0..count-1 and a descending
+        // walk runs downwards, so a cursor at fraction f of the way down is (1 - f) * count:
+        // f = 0.5 asks for the page that begins halfway through the order. An ascending walk
+        // starts from the other end: the cursor is f * count and the bound is '>'.
         db.data.window_cursor = 0;
         let window_clause = "";
         if SEARCH_WINDOW_FROM > 0.0 {
-            db.data.window_cursor = ((1.0 - SEARCH_WINDOW_FROM) * SORT_VALUE_COUNT as f64) as i64;
-            window_clause = ` AND ${ORDER_BY} < :cursor`;
-            println!("Window: {} < {}", ORDER_BY, db.data.window_cursor);
+            if ascending {
+                db.data.window_cursor = (SEARCH_WINDOW_FROM * SORT_VALUE_COUNT as f64) as i64;
+                window_clause = ` AND ${ORDER_BY} > :cursor`;
+                println!("Window: {} > {}", ORDER_BY, db.data.window_cursor);
+            } else {
+                db.data.window_cursor = ((1.0 - SEARCH_WINDOW_FROM) * SORT_VALUE_COUNT as f64) as i64;
+                window_clause = ` AND ${ORDER_BY} < :cursor`;
+                println!("Window: {} < {}", ORDER_BY, db.data.window_cursor);
+            }
         }
         let order_clause = "";
         if SEARCH_ORDERED {
-            order_clause = ` ORDER BY ${ORDER_BY} DESC`;
+            if ascending {
+                order_clause = ` ORDER BY ${ORDER_BY} ASC`;
+            } else {
+                order_clause = ` ORDER BY ${ORDER_BY} DESC`;
+            }
         }
         db.prepare(SEARCH, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern${window_clause}${order_clause} LIMIT ${SEARCH_LIMIT}`).await?;
 
@@ -341,6 +373,8 @@ pub async fn prepare(db) {
         db.set_report_field("compute_accuracy", `${COMPUTE_ACCURACY}`);
         db.set_report_field("search_ordered", `${SEARCH_ORDERED}`);
         db.set_report_field("search_window_from", `${SEARCH_WINDOW_FROM}`);
+        db.set_report_field("search_direction", SEARCH_DIRECTION);
+        db.set_report_field("search_match", SEARCH_MATCH);
 
         db.declare_metric("result_count", "higher");
 

@@ -103,6 +103,22 @@ datasets:
           - set: char32
             ordered: true
             qrels: true
+          # The other direction, and a page from its far end: the same rows come back oldest
+          # first, from a cursor the script places a fraction of the way up.
+          - set: char2
+            ordered: true
+            order: asc
+          - set: char2
+            ordered: true
+            order: asc
+            window: 0.5
+          # A prefix and a suffix are containment with the value's edge marked; the ordered
+          # suffix shape checks the anchored walk pages too.
+          - set: char2
+            match: prefix
+          - set: char2
+            match: suffix
+            ordered: true
 
   # The backfill case: the index is created AFTER the load, so vector-store builds it by a full
   # scan in token order and every segment spans the whole sort range whatever order the rows were

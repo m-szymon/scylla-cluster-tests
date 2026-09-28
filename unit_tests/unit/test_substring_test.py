@@ -298,12 +298,20 @@ def test_the_ordering_parameters_exist(script_source):
     """The plan's 'ordered' and 'window' keys become these. A rename makes latte ignore the flag
     and run the plain query, which still reports a latency -- of the wrong question."""
     declared = set(RUNE_PARAM_RE.findall(script_source))
-    assert {"order_by", "search_ordered", "search_window_from", "sort_value_count"} <= declared
+    assert {
+        "order_by",
+        "search_ordered",
+        "search_window_from",
+        "sort_value_count",
+        "search_direction",
+        "search_match",
+    } <= declared
 
 
 def test_the_script_can_emit_an_order_by_clause(script_source):
     """Declaring the parameters is not enough; the query has to be built from them."""
     assert "ORDER BY ${ORDER_BY} DESC" in script_source
+    assert "ORDER BY ${ORDER_BY} ASC" in script_source
     assert "'order_by': '${ORDER_BY}', " in script_source
 
 
@@ -320,6 +328,12 @@ def test_an_ordered_shape_without_an_ordered_index_is_refused(script_source):
         ({"set": "char2", "ordered": True}, " ordered"),
         ({"set": "char2", "ordered": True, "window": 0.5}, " ordered from 0.5"),
         ({"set": "char2", "window": 0.5}, " window from 0.5"),
+        ({"set": "char2", "ordered": True, "order": "asc"}, " ordered asc"),
+        ({"set": "char2", "ordered": True, "window": 0.5, "order": "asc"}, " ordered from 0.5 asc"),
+        # A direction without an order to apply it to changes nothing, so it is not in the label.
+        ({"set": "char2", "order": "asc"}, ""),
+        ({"set": "char2", "match": "prefix"}, " prefix"),
+        ({"set": "char2", "match": "suffix", "ordered": True}, " suffix ordered"),
     ],
 )
 def test_the_shape_is_part_of_the_row_label(query, expected):
@@ -358,3 +372,31 @@ def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
             for query in step.get("queries", [])
         )
         assert not asks_for_ordering or order_by, f"{plan_name} asks for ordering, {case_name} sets no order_by"
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ({"set": "char2"}, ""),
+        ({"set": "char2", "match": "prefix"}, "-P search_match=prefix "),
+        ({"set": "char2", "ordered": True}, "-P search_ordered=true "),
+        ({"set": "char2", "ordered": True, "order": "asc"}, "-P search_ordered=true -P search_direction=asc "),
+        (
+            {"set": "char2", "match": "suffix", "ordered": True, "window": 0.5},
+            "-P search_match=suffix -P search_ordered=true -P search_window_from=0.5 -P sort_value_count=3000 ",
+        ),
+    ],
+)
+def test_the_direction_and_the_match_become_script_parameters(query, expected):
+    """'order: asc' and 'match: prefix|suffix' reach latte as parameters; the defaults are not
+    spelled out, so a script that predates them runs unchanged."""
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.params = {"latte_schema_parameters": {"order_by": "register_time"}}
+    assert test.extra_search_params(query, 3000) == expected
+
+
+@pytest.mark.parametrize("query", [{"set": "char2", "order": "up"}, {"set": "char2", "match": "infix"}])
+def test_an_unknown_direction_or_match_is_refused(query):
+    with pytest.raises(ValueError):
+        substring_test.SubstringSearchTest.query_shape_label(None, query)
+
