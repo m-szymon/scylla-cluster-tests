@@ -378,12 +378,12 @@ def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
     "query, expected",
     [
         ({"set": "char2"}, ""),
-        ({"set": "char2", "match": "prefix"}, "-P search_match=prefix "),
+        ({"set": "char2", "match": "prefix"}, "-P search_match=\\\"prefix\\\" "),
         ({"set": "char2", "ordered": True}, "-P search_ordered=true "),
-        ({"set": "char2", "ordered": True, "order": "asc"}, "-P search_ordered=true -P search_direction=asc "),
+        ({"set": "char2", "ordered": True, "order": "asc"}, "-P search_ordered=true -P search_direction=\\\"asc\\\" "),
         (
             {"set": "char2", "match": "suffix", "ordered": True, "window": 0.5},
-            "-P search_match=suffix -P search_ordered=true -P search_window_from=0.5 -P sort_value_count=3000 ",
+            "-P search_match=\\\"suffix\\\" -P search_ordered=true -P search_window_from=0.5 -P sort_value_count=3000 ",
         ),
     ],
 )

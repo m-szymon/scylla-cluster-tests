@@ -418,7 +418,7 @@ class SubstringSearchTest(SearchPerformanceTest):
         window = _checked_window(query.get("window", 0.0))
         direction = _checked_direction(query.get("order", "desc"))
         match = _checked_match(query.get("match", "contains"))
-        params = f"-P search_match={match} " if match != "contains" else ""
+        params = rf"-P search_match=\"{match}\" " if match != "contains" else ""
         if not ordered and window <= 0.0:
             return params
         if not self._order_by:
@@ -430,7 +430,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
         params += f"-P search_ordered={'true' if ordered else 'false'} "
         if direction != "desc":
-            params += f"-P search_direction={direction} "
+            params += rf"-P search_direction=\"{direction}\" "
         if window > 0.0:
             params += f"-P search_window_from={window} -P sort_value_count={record_count} "
         return params
