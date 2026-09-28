@@ -348,6 +348,11 @@ latte_schema_parameters:
   order_by: 'register_time'
 ```
 
+`case_sensitive: 'false'` is what a search box wants. Set it to `'true'` for a run that measures
+stage 5, where ScyllaDB rather than the index node checks the candidates for a keyword longer
+than `max_gram`: the node only does that hand-over for a case-sensitive index.
+
+
 `max_gram` is the knob that trades index size for the cost of long keywords: at 3, a keyword of four
 or more characters is answered by intersecting three-character grams and verifying each candidate.
 
