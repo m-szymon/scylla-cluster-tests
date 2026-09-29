@@ -100,7 +100,10 @@ latte_schema_parameters:
   table: 'users'
   min_gram: 1
   max_gram: 3
-  case_sensitive: 'false'
+  # 'true' here, unlike the AWS case: the smoke exists to exercise every code path, and only a
+  # case-sensitive index takes the stage-5 path where ScyllaDB checks the long-keyword candidates
+  # itself. The corpora and keywords are lowercase, so nothing else changes.
+  case_sensitive: 'true'
   # The column the index keeps its matches sorted by. Setting it gives the table a 'register_time'
   # bigint carrying the third field of the names file, and creates the index to order by it, which
   # is what lets a plan ask a query set with 'ordered' or 'window'. Remove it to run the stage-1
