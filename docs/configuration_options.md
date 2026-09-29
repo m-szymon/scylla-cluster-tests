@@ -4775,6 +4775,15 @@ Enable hdr histogram logging for cs
 **type:** bool
 
 
+## **grafana_screenshots_per_cycle** / SCT_GRAFANA_SCREENSHOTS_PER_CYCLE
+
+Take Grafana screenshots at the end of every latency_calculator_decorator cycle. About a minute each; a benchmark with many short phases can turn them off and rely on the end-of-test ones.
+
+**default:** True
+
+**type:** bool
+
+
 ## **stop_on_hw_perf_failure** / SCT_STOP_ON_HW_PERF_FAILURE
 
 Stop sct performance test if hardware performance test failed<br><br>Hardware performance tests runs on each node with sysbench and cassandra-fio tools.<br>Results stored in ES. HW perf tests run during cluster setups and not affect<br>SCT Performance tests. Results calculated as average among all results for certain<br>instance type or among all nodes during single run.<br>if results for a single node is not in margin 0.01 of<br>average result for all nodes, hw test considered as Failed.<br>If stop_on_hw_perf_failure is True, then sct performance test will be terminated<br>after hw perf tests detect node with hw results not in margin with average<br>If stop_on_hw_perf_failure is False, then sct performance test will be run<br>even after hw perf tests detect node with hw results not in margin with average

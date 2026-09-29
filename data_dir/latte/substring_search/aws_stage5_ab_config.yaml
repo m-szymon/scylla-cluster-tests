@@ -19,8 +19,12 @@
 # The rewrite (backfill) is left out on purpose: it failed on the runner's side on 2026-09-29, and
 # a failure there would take this comparison with it. It gets a run of its own.
 #
-# Budget: provisioning ~20 min, load ~33 min, two rounds of 13 phases ~22 min each, teardown
-# ~5 min: ~1:45.
+# The corpus is the 2026-09-28 one in 10 shards of 1M names (shards_100k/ keeps the original 100;
+# concatenating them in groups of ten gives the same bytes). A shard costs ~20 s of staging
+# before its insert, which at 100 shards was 34 of the load's 40 minutes.
+#
+# Budget: provisioning ~20 min, load ~8 min, two rounds of 13 phases (60 s each, no per-phase
+# Grafana screenshots) ~20 min each, log collection ~5 min, teardown ~7 min: ~1:20.
 datasets:
   - name: names_10M_long
     index_during_load: true
@@ -33,12 +37,12 @@ datasets:
         options: {poc_option_2: '100000'}
     defaults:
       limit: 20
-      duration: 90s
+      duration: 60s
       concurrency: 64
       rate: 0
       expected_p99_read_ms: 100
     steps:
-      - shards: [0..99]
+      - shards: [0..9]
         queries:
           # capacity
           - {set: char1, ordered: true}

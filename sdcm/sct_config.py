@@ -2476,6 +2476,10 @@ class SCTConfiguration(BaseModel):
     use_hdrhistogram: Boolean = SctField(
         description="Enable hdr histogram logging for cs",
     )
+    grafana_screenshots_per_cycle: Boolean = SctField(
+        description="Take Grafana screenshots at the end of every latency_calculator_decorator cycle. About a "
+        "minute each; a benchmark with many short phases can turn them off and rely on the end-of-test ones.",
+    )
     stop_on_hw_perf_failure: Boolean = SctField(
         description="""Stop sct performance test if hardware performance test failed
 

@@ -268,7 +268,9 @@ def latency_calculator_decorator(  # noqa: PLR0915
             try:
                 monitor = monitoring_set.nodes[0] if monitoring_set and monitoring_set.nodes else None
                 screenshots = (
-                    monitoring_set.get_grafana_screenshots(node=monitor, test_start_time=start) if monitor else []
+                    monitoring_set.get_grafana_screenshots(node=monitor, test_start_time=start)
+                    if monitor and tester.params.get("grafana_screenshots_per_cycle")
+                    else []
                 )
                 if workload_type:
                     workload = workload_type

@@ -295,6 +295,23 @@ the fallback value. The run then posts to the real Argus and fills its log with
 `No SCTTestRun found matching ...` and `Failed to submit heartbeat to argus`. Not fatal, but they
 retry with backoff and bury everything else.
 
+## Keeping a run short
+
+Measured on the 2026-09-29 run, most of the wall clock was not measurement:
+
+- **Every latte invocation stages the whole workload directory** from the runner to the loader,
+  one rsync per file, about 20 s in all before a shard's two-second insert. At 100 shards that
+  was 34 of the load's 40 minutes. Keep a corpus in few large shards: `names_10M_long` is 10
+  shards of 1M names (the original 100 are in `shards_100k/`; concatenating them in groups of
+  ten gives the same bytes, so results stay comparable).
+- **A Grafana screenshot pass after every query phase** took about a minute.
+  `grafana_screenshots_per_cycle: false` (set in the AWS test case) skips it; the end-of-test
+  screenshots remain.
+- **Throughput settles within seconds**, so capacity phases of 60 s are enough.
+- `collect_logs: true` (set in the AWS test case) costs a few minutes at teardown and brings back
+  the index node's service log and a Prometheus snapshot with every node's CPU, which the
+  2026-09-29 run lacked when it failed.
+
 ## Reading the results
 
 | where | what |

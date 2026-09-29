@@ -163,6 +163,13 @@ user_prefix: 'substring-search'
 # included: the counters and the hdr files a failed round leaves are saved by the run's logs, and
 # a run that dies with the runner is cleaned by 'hydra clean-resources --test-id' afterwards.
 execute_post_behavior: true
+# The index node's service log, every node's logs and a Prometheus snapshot (CPU of every node,
+# the index node's included), collected before the nodes are destroyed and uploaded privately.
+# Without them the 2026-09-29 run's failure could not be diagnosed.
+collect_logs: true
+# A Grafana screenshot pass takes about a minute after every query phase; the plans here have
+# dozens of phases and the end-of-test screenshots are enough.
+grafana_screenshots_per_cycle: false
 post_behavior_db_nodes: 'destroy'
 post_behavior_loader_nodes: 'destroy'
 post_behavior_monitor_nodes: 'destroy'

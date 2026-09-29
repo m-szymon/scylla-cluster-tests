@@ -16,7 +16,9 @@
 # Budget: provisioning ~20 min, load ~33 min, one round of eight phases ~27 min, second load
 # ~33 min, build + rewrite ~10 min, one round of three phases ~11 min, teardown ~5 min: ~2:20.
 #
-# The backfill dataset directory is the same corpus under another name:
+# The corpus is kept in 10 shards of 1M names since 2026-09-29 (same bytes as the 100 of 100k it was
+# measured with; shards_100k/ keeps those). The backfill dataset directory is the same corpus under
+# another name:
 #   ln -s names_10M_long data_dir/latte/substring_search/names_10M_long_backfill
 datasets:
   - name: names_10M_long
@@ -33,7 +35,7 @@ datasets:
       rate: 10000
       expected_p99_read_ms: 100
     steps:
-      - shards: [0..99]
+      - shards: [0..9]
         queries:
           - set: char2
             ordered: true
@@ -67,7 +69,7 @@ datasets:
       rate: 10000
       expected_p99_read_ms: 100
     steps:
-      - shards: [0..99]
+      - shards: [0..9]
         queries:
           - set: char2
             ordered: true
