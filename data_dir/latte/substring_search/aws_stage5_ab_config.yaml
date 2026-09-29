@@ -1,0 +1,57 @@
+# Stage 5 A/B: who checks the candidates of a keyword longer than max_gram, on one index definition
+# and one load. Two variants of the capped index (100k rows a segment) ingest the same CDC stream;
+# they differ only in 'verify_candidates':
+#   node_checks    'index'  -- the index node verifies against its stored text (stages 2-4)
+#   scylla_checks  default  -- ScyllaDB verifies on the rows it reads anyway (stage 5)
+# Run with the case-sensitive overlay, the only index shape ScyllaDB can check:
+#   --config test-cases/substring-search/substring-search-test.yaml
+#   --config test-cases/substring-search/stage5-case-sensitive.yaml
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_stage5_ab_config.yaml
+#
+# Every query set is measured twice, because a fixed rate above what a shape can serve measures
+# the loader's queue rather than the query (the 2026-09-28 and 2026-09-29 runs did that):
+#   capacity  unthrottled, 64 in flight: queries per second, comparable between variants and runs.
+#   latency   a fixed rate below every variant's capacity, 16 in flight: client p50/p99, the number
+#             the requirement (p99 < 100 ms) is about. Rates from the capacities measured on
+#             2026-09-28/29: short keywords and 8 characters at 2,000/s (stage 1's realistic
+#             rate), 16 characters at 1,000/s, 32 characters at 500/s.
+#
+# The rewrite (backfill) is left out on purpose: it failed on the runner's side on 2026-09-29, and
+# a failure there would take this comparison with it. It gets a run of its own.
+#
+# Budget: provisioning ~20 min, load ~33 min, two rounds of 13 phases ~22 min each, teardown
+# ~5 min: ~1:45.
+datasets:
+  - name: names_10M_long
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      - label: node_checks
+        options: {poc_option_2: '100000', verify_candidates: 'index'}
+      - label: scylla_checks
+        options: {poc_option_2: '100000'}
+    defaults:
+      limit: 20
+      duration: 90s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          # capacity
+          - {set: char1, ordered: true}
+          - {set: char2, ordered: true}
+          - {set: char2, ordered: true, window: 0.5}
+          - {set: char4, ordered: true}
+          - {set: char8, ordered: true}
+          - {set: char8, ordered: true, window: 0.5}
+          - {set: char16, ordered: true}
+          - {set: char32, ordered: true}
+          # latency, below capacity
+          - {set: char2, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char4, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char8, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char16, ordered: true, rate: 1000, concurrency: 16, duration: 60s}
+          - {set: char32, ordered: true, rate: 500, concurrency: 16, duration: 60s}
