@@ -1,0 +1,14 @@
+# Overlay for a stage-5 measurement: pass it after substring-search-test.yaml
+# (`--config substring-search-test.yaml --config stage5-case-sensitive.yaml`).
+#
+# Only a case-sensitive index takes the stage-5 path, where ScyllaDB rather than the index node
+# checks the candidates for a keyword longer than max_gram. The corpora and keywords are
+# lowercase, so the numbers stay comparable with the case-insensitive runs; the whole map is
+# repeated because a later config file replaces a dict key rather than merging into it.
+latte_schema_parameters:
+  keyspace: 'substring_bench'
+  table: 'users'
+  min_gram: 1
+  max_gram: 3
+  case_sensitive: 'true'
+  order_by: 'register_time'
