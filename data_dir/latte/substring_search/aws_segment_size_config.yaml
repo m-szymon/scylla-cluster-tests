@@ -1,0 +1,58 @@
+# Segment size sweep: how flat is the cost across query shapes as segments grow. Three variants
+# of the capped index ingest the same CDC stream and differ only in the cap (poc_option_2, rows a
+# segment). All three run vector-store a7fefd2 (a segment that passes the gram check has its
+# postings built from the entries the check found) and verify on the node
+# (verify_candidates: 'index'), which the 2026-09-29 A/B showed costs no capacity.
+#   cap_100k  the layout of the 2026-09-29 runs (130-152 segments at 10M)
+#   cap_200k  half the segments
+#   cap_400k  a quarter
+# Fewer segments mean fewer gram checks and opened segments for a rare long keyword, and more
+# postings per segment for a short keyword and a deep page (window 0.5). The spread between the
+# best and the worst shape per variant is the number to compare, not the average.
+# Run with the case-sensitive overlay, so that cap_100k compares with run 4ce3f8b8:
+#   --config test-cases/substring-search/substring-search-test.yaml
+#   --config test-cases/substring-search/stage5-case-sensitive.yaml
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_segment_size_config.yaml
+#
+# Capacity phases are unthrottled with 64 in flight; latency phases run at a fixed rate below
+# every variant's capacity with 16 in flight. 'miss' is keywords that match nothing.
+#
+# Budget: provisioning ~20 min, load and ingest ~10 min, three rounds of 14 phases (60 s each)
+# ~19 min each, log collection ~5 min, teardown ~7 min: ~1:40.
+datasets:
+  - name: names_10M_long
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    index_variants:
+      - label: cap_100k
+        options: {poc_option_2: '100000', verify_candidates: 'index'}
+      - label: cap_200k
+        options: {poc_option_2: '200000', verify_candidates: 'index'}
+      - label: cap_400k
+        options: {poc_option_2: '400000', verify_candidates: 'index'}
+    defaults:
+      limit: 20
+      duration: 60s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries:
+          # capacity
+          - {set: char1, ordered: true}
+          - {set: char2, ordered: true}
+          - {set: char2, ordered: true, window: 0.5}
+          - {set: char4, ordered: true}
+          - {set: char8, ordered: true}
+          - {set: char8, ordered: true, window: 0.5}
+          - {set: char16, ordered: true}
+          - {set: char32, ordered: true}
+          - {set: miss, ordered: true}
+          # latency, below capacity
+          - {set: char2, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char4, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char8, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char16, ordered: true, rate: 1000, concurrency: 16, duration: 60s}
+          - {set: char32, ordered: true, rate: 500, concurrency: 16, duration: 60s}
