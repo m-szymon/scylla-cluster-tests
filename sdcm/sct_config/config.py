@@ -64,6 +64,7 @@ from sdcm.utils.common import (
     get_vector_store_ami_versions,
 )
 from sdcm.utils import oci_utils
+from sdcm.utils.vector_store_utils import is_vector_store_source_build
 from sdcm.utils.operations_thread import ConfigParams
 from sdcm.utils.version_utils import (
     ARGUS_VERSION_RE,
@@ -650,6 +651,10 @@ class SCTConfiguration(*CONFIG_GROUPS):
         if not self.get("billing_project"):
             self["billing_project"] = "no_billing_project"
 
+        # 4.1) reject a contradictory vector-store request before any AMI lookup, so that a
+        # misconfiguration is reported as such instead of surfacing as a cloud API error
+        self._validate_vector_store_source_params()
+
         # 4) update events max severities
         add_severity_limit_rules(self.get("max_events_severities"))
         print_critical_events()
@@ -912,20 +917,20 @@ class SCTConfiguration(*CONFIG_GROUPS):
             if self.get("ami_id_vector_store"):
                 raise ValueError("'vector_store_version' can't be used together with 'ami_id_vector_store'")
             if self.get("cluster_backend") == "aws":
-                ami_list = []
-                for region in region_names:
-                    aws_arch = get_arch_from_instance_type(self.get("instance_type_vector_store"), region_name=region)
-                    try:
-                        ami = get_vector_store_ami_versions(version=vs_version, region_name=region, arch=aws_arch)[0]
-                    except Exception as ex:  # noqa: BLE001
-                        raise ValueError(
-                            f"AMIs for vs_version='{vs_version}' not found in {region} arch={aws_arch}"
-                        ) from ex
-                    self.log.debug(
-                        "Found AMI %s(%s) for vs_version='%s' in %s", ami.name, ami.image_id, vs_version, region
-                    )
-                    ami_list.append(ami)
-                self["ami_id_vector_store"] = " ".join(ami.image_id for ami in ami_list)
+                self["ami_id_vector_store"] = self._resolve_vector_store_amis(region_names, version=vs_version)
+
+        # 6.2.1) handle a vector-store source build. It is requested by setting either
+        # 'vector_store_source_repo' or 'vector_store_source_ref' -- see is_vector_store_source_build().
+        # Gated on the backend like 6.2 above: '_validate_vector_store_source_params' deliberately
+        # passes a backend-less config through (see the NOTE there), so without this the utility
+        # subcommands that build an SCTConfiguration just to read params -- 'upload', 'send-email' --
+        # would make an AWS AMI lookup for a run that provisions nothing.
+        if is_vector_store_source_build(self) and self.get("cluster_backend") == "aws":
+            # The base AMI only has to provide the right architecture -- whichever vector-store it
+            # ships is replaced by the source build. So default it to the newest VS AMI available
+            # instead of making every test case hand-pin an AMI id.
+            if not self.get("ami_id_vector_store"):
+                self["ami_id_vector_store"] = self._resolve_vector_store_amis(region_names, version=None)
 
         # 6.3) if a region-fallback relocated the cluster, re-resolve region-bound AWS AMIs for the new region
         if self._resolved_placement_source_region:
@@ -3101,6 +3106,62 @@ class SCTConfiguration(*CONFIG_GROUPS):
                 ret += f"{help_text}{field_name}: {default}\n\n"
 
         return ret
+
+    def _validate_vector_store_source_params(self) -> None:
+        """Reject contradictory vector-store source-build requests.
+
+        A source build is requested by setting either 'vector_store_source_repo' or
+        'vector_store_source_ref' -- see is_vector_store_source_build(). Pure param checks, no
+        cloud lookups, so they can run before AMI resolution.
+        """
+        if not is_vector_store_source_build(self):
+            return
+
+        # NOTE: these are provisioning checks, so skip them when no backend is configured at all.
+        #       Several utility subcommands build an SCTConfiguration purely to read params out of
+        #       the test case and provision nothing -- 'upload', 'send-email',
+        #       'create-argus-test-run', the runner-image commands. The Jenkins steps behind some of
+        #       them export SCT_CONFIG_FILES without SCT_CLUSTER_BACKEND (see
+        #       vars/collectBuilderLogs.groovy, vars/runSendEmail.groovy), so failing here would
+        #       break the post-test steps of every job whose test case asks for a source build.
+        backend = self.get("cluster_backend")
+        if not backend:
+            return
+
+        # Backend first: on the other backends 'vector_store_version' means an image tag, so
+        # complaining about it before saying source builds are unsupported here would send the
+        # reader after the wrong param.
+        if backend != "aws":
+            raise ValueError(
+                f"'vector_store_source_repo'/'vector_store_source_ref' is only supported on the aws backend, "
+                f"not '{backend}'. To test your own build here, build the image yourself and set "
+                f"'vector_store_docker_image' and 'vector_store_version' to point at it."
+            )
+        if self.get("vector_store_version"):
+            raise ValueError(
+                "'vector_store_source_repo'/'vector_store_source_ref' can't be used together with "
+                "'vector_store_version': the former builds vector-store from source, the latter selects "
+                "a prebuilt release. Pick one."
+            )
+
+    def _resolve_vector_store_amis(self, region_names: List[str], version: str | None) -> str:
+        """Resolve one Vector Store AMI id per region, space-joined.
+
+        `version` selects a specific vector-store release; `None` takes the newest VS AMI
+        available for the region's architecture, which is what a source build wants -- there the
+        base AMI only has to supply the right arch, since the shipped binary gets replaced.
+        """
+        ami_list = []
+        for region in region_names:
+            aws_arch = get_arch_from_instance_type(self.get("instance_type_vector_store"), region_name=region)
+            try:
+                ami = get_vector_store_ami_versions(version=version, region_name=region, arch=aws_arch)[0]
+            except Exception as ex:  # noqa: BLE001
+                wanted = f"vs_version='{version}'" if version else "the latest vector-store AMI"
+                raise ValueError(f"AMIs for {wanted} not found in {region} arch={aws_arch}") from ex
+            self.log.debug("Found AMI %s(%s) for %s in %s", ami.name, ami.image_id, version or "latest", region)
+            ami_list.append(ami)
+        return " ".join(ami.image_id for ami in ami_list)
 
     def _verify_migrator_source_params(self):
         if self.get("migrator_source_hosts") and self.get("migrator_source_test_id"):
