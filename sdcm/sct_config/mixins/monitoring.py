@@ -79,6 +79,10 @@ class MonitoringConfigMixin(BaseModel):
         '&nbsp;&nbsp;&nbsp;&nbsp;panel_title: "Total Disk Usage"<br>'
         "&nbsp;&nbsp;&nbsp;&nbsp;resolution: [1920, 800]",
     )
+    grafana_screenshots_per_cycle: Boolean = SctField(
+        description="Take Grafana screenshots at the end of every latency_calculator_decorator cycle. About a "
+        "minute each; a benchmark with many short phases can turn them off and rely on the end-of-test ones.",
+    )
     max_events_severities: StringOrList = SctField(
         default=[],
         description="Limit severity level for event types",

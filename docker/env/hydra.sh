@@ -154,7 +154,9 @@ if [[ -n "$JENKINS_URL" || -n "$BUILD_TAG" || -n "$GITHUB_ACTIONS" ]]; then
     echo "Running on Build Server..."
     HOST_NAME=`hostname`
 else
-    TTY_STDIN="-it"
+    # Only when there is a terminal to attach: a developer running hydra from a script or in the
+    # background has none, and docker refuses '-t' then ("the input device is not a TTY").
+    [[ -t 0 ]] && TTY_STDIN="-it"
     TPUT_OPTIONS=""
     [[ -z "$TERM" || "$TERM" == 'dumb' ]] && TPUT_OPTIONS="-T xterm-256color"
     TERM_SET_SIZE="export COLUMNS=`tput $TPUT_OPTIONS cols`; export LINES=`tput $TPUT_OPTIONS lines`;"
@@ -201,7 +203,13 @@ JENKINS_OPTIONS=$(env | sed -n 's/^\(JENKINS_[^=]*\)=.*/--env \1/p')
 
 
 is_podman="$($tool --help | { grep -o podman || :; })"
-docker_common_args=()
+docker_common_args=(
+    # The image pins every Python dependency SCT needs, and the run mounts the caller's home
+    # directory, which puts ~/.local/lib/pythonX.Y/site-packages ahead of them on sys.path. A
+    # host package of the same name as a pinned one then shadows it, and hydra dies on an import
+    # error from inside the image -- a machine-specific failure that looks like a broken checkout.
+    -e PYTHONNOUSERSITE=1
+)
 
 function EPHEMERAL_PORT() {
     LOW_BOUND=49152

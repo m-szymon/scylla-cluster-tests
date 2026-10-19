@@ -75,6 +75,9 @@ data_dir/ssl_conf/
 # and left alone; a fetched shard is deleted once loaded. Only the rune scripts and the config YAMLs
 # are tracked here.
 data_dir/latte/fts_search/*/
+# Same for the substring-search corpora, written by
+# data_dir/latte/substring_search/generate_local_dataset.py.
+data_dir/latte/substring_search/*/
 
 # Internal private repo
 scylla-qa-internal/

@@ -28,7 +28,7 @@ concerns first, then one page per backend, then one per test type.
 
 ## Groups
 
-535 options across 29 groups.
+540 options across 29 groups.
 
 | Group | Options | What it covers |
 |---|---:|---|
@@ -36,13 +36,13 @@ concerns first, then one page per backend, then one per test type.
 | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) | 44 | Which Scylla to install and how it is configured: repos, versions, distro, `scylla.yaml`/command-line options, experimental... |
 | [Nemesis (chaos testing)](configuration_options/nemesis-chaos-testing.md) | 12 | Which disruptions run, how often, and how targets are selected. |
 | [Stress commands and load generation](configuration_options/stress-commands-and-load-generation.md) | 74 | The load applied to the cluster: stress tool command lines, loader-side settings and stress duration. **Which option belongs... |
-| [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) | 18 | The monitoring stack, event severities, Argus reporting and email reports. |
+| [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) | 19 | The monitoring stack, event severities, Argus reporting and email reports. |
 | [Logs, diagnostics and teardown](configuration_options/logs-diagnostics-and-teardown.md) | 13 | How logs and diagnostics are collected, and what happens to the resources when the test ends. |
 | [Scylla Doctor](configuration_options/scylla-doctor.md) | 6 | The scylla-doctor diagnostic tool. It is both a subject under test (the artifact tests run it and assert on its findings) and... |
 | [Scylla Manager](configuration_options/scylla-manager.md) | 26 | Scylla Manager server and agent: versions, repos and backup/restore settings. |
 | [Auxiliary DB cluster (oracle / Cassandra)](configuration_options/auxiliary-db-cluster-oracle-cassandra.md) | 10 | A second database cluster used for comparison or migration testing -- the 'oracle' cluster in Gemini runs, or a Cassandra... |
 | [Alternator (DynamoDB API)](configuration_options/alternator-dynamodb-api.md) | 10 | Scylla's DynamoDB-compatible API: the endpoint, write isolation, load-balancing and the credentials the tests use against it. |
-| [Vector Store](configuration_options/vector-store.md) | 9 | The Vector Store service under test alongside Scylla. |
+| [Vector Store](configuration_options/vector-store.md) | 12 | The Vector Store service under test alongside Scylla. |
 | [Kafka / CDC connectors](configuration_options/kafka-cdc-connectors.md) | 2 | Kafka deployment and connector configuration for CDC testing. |
 | [AWS backend](configuration_options/aws-backend.md) | 24 | AWS-specific provisioning: AMIs, EC2 instance and disk settings, placement groups, capacity reservations and dedicated hosts. |
 | [GCE backend](configuration_options/gce-backend.md) | 24 | Google Compute Engine provisioning. |
@@ -54,7 +54,7 @@ concerns first, then one page per backend, then one per test type.
 | [Scylla Cloud (xcloud) backend](configuration_options/scylla-cloud-xcloud-backend.md) | 12 | Clusters provisioned through the Scylla Cloud API, including the legacy siren `cloud_*` options. |
 | [Minicloud](configuration_options/minicloud.md) | 16 | Minicloud is an AWS-API-compatible environment rather than a cloud of its own: it runs with `cluster_backend: aws` and an... |
 | [Longevity tests](configuration_options/longevity-tests.md) | 13 | Options specific to long-running longevity test scenarios. |
-| [Performance regression tests](configuration_options/performance-regression-tests.md) | 18 | Throughput/latency measurement runs, including gradual-throughput steps and HDR histogram settings. |
+| [Performance regression tests](configuration_options/performance-regression-tests.md) | 19 | Throughput/latency measurement runs, including gradual-throughput steps and HDR histogram settings. |
 | [Upgrade tests](configuration_options/upgrade-tests.md) | 20 | Rolling upgrade and rollback scenarios: target versions and the load applied across the upgrade. |
 | [Grow cluster tests](configuration_options/grow-cluster-tests.md) | 2 | Scaling the cluster up and down during a test. |
 | [Refresh (sstable loading) tests](configuration_options/refresh-sstable-loading-tests.md) | 6 | Loading pre-built SSTables into a running cluster via nodetool refresh. |
@@ -250,6 +250,7 @@ concerns first, then one page per backend, then one per test type.
 | [`gke_cluster_version`](configuration_options/kubernetes-backends-eks-gke-kind.md#gke_cluster_version) | `SCT_GKE_CLUSTER_VERSION` | [Kubernetes backends (EKS/GKE/kind)](configuration_options/kubernetes-backends-eks-gke-kind.md) |
 | [`gke_k8s_release_channel`](configuration_options/kubernetes-backends-eks-gke-kind.md#gke_k8s_release_channel) | `SCT_GKE_K8S_RELEASE_CHANNEL` | [Kubernetes backends (EKS/GKE/kind)](configuration_options/kubernetes-backends-eks-gke-kind.md) |
 | [`grafana_screenshot_panels`](configuration_options/monitoring-events-and-reporting.md#grafana_screenshot_panels) | `SCT_GRAFANA_SCREENSHOT_PANELS` | [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) |
+| [`grafana_screenshots_per_cycle`](configuration_options/monitoring-events-and-reporting.md#grafana_screenshots_per_cycle) | `SCT_GRAFANA_SCREENSHOTS_PER_CYCLE` | [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) |
 | [`hinted_handoff`](configuration_options/scylla-installation-and-configuration.md#hinted_handoff) | `SCT_HINTED_HANDOFF` | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) |
 | [`install_cassandra_exporter`](configuration_options/auxiliary-db-cluster-oracle-cassandra.md#install_cassandra_exporter) | `SCT_INSTALL_CASSANDRA_EXPORTER` | [Auxiliary DB cluster (oracle / Cassandra)](configuration_options/auxiliary-db-cluster-oracle-cassandra.md) |
 | [`install_mode`](configuration_options/scylla-installation-and-configuration.md#install_mode) | `SCT_INSTALL_MODE` | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) |
@@ -471,6 +472,7 @@ concerns first, then one page per backend, then one per test type.
 | [`scylla_repo_m`](configuration_options/scylla-manager.md#scylla_repo_m) | `SCT_SCYLLA_REPO_M` | [Scylla Manager](configuration_options/scylla-manager.md) |
 | [`scylla_rsyslog_setup`](configuration_options/monitoring-events-and-reporting.md#scylla_rsyslog_setup) | `SCT_SCYLLA_RSYSLOG_SETUP` | [Monitoring, events and reporting](configuration_options/monitoring-events-and-reporting.md) |
 | [`scylla_version`](configuration_options/scylla-installation-and-configuration.md#scylla_version) | `SCT_SCYLLA_VERSION` | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) |
+| [`search_test_config`](configuration_options/performance-regression-tests.md#search_test_config) | `SCT_SEARCH_TEST_CONFIG` | [Performance regression tests](configuration_options/performance-regression-tests.md) |
 | [`seeds_num`](configuration_options/general-and-provisioning.md#seeds_num) | `SCT_SEEDS_NUM` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`seeds_selector`](configuration_options/general-and-provisioning.md#seeds_selector) | `SCT_SEEDS_SELECTOR` | [General and provisioning](configuration_options/general-and-provisioning.md) |
 | [`server_encrypt`](configuration_options/scylla-installation-and-configuration.md#server_encrypt) | `SCT_SERVER_ENCRYPT` | [Scylla installation and configuration](configuration_options/scylla-installation-and-configuration.md) |
@@ -586,6 +588,9 @@ concerns first, then one page per backend, then one per test type.
 | [`vector_store_scylla_port`](configuration_options/vector-store.md#vector_store_scylla_port) | `SCT_VECTOR_STORE_SCYLLA_PORT` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_scylla_username`](configuration_options/vector-store.md#vector_store_scylla_username) | `SCT_VECTOR_STORE_SCYLLA_USERNAME` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_service_level_shares`](configuration_options/vector-store.md#vector_store_service_level_shares) | `SCT_VECTOR_STORE_SERVICE_LEVEL_SHARES` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_build_timeout`](configuration_options/vector-store.md#vector_store_source_build_timeout) | `SCT_VECTOR_STORE_SOURCE_BUILD_TIMEOUT` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_ref`](configuration_options/vector-store.md#vector_store_source_ref) | `SCT_VECTOR_STORE_SOURCE_REF` | [Vector Store](configuration_options/vector-store.md) |
+| [`vector_store_source_repo`](configuration_options/vector-store.md#vector_store_source_repo) | `SCT_VECTOR_STORE_SOURCE_REPO` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_threads`](configuration_options/vector-store.md#vector_store_threads) | `SCT_VECTOR_STORE_THREADS` | [Vector Store](configuration_options/vector-store.md) |
 | [`vector_store_version`](configuration_options/vector-store.md#vector_store_version) | `SCT_VECTOR_STORE_VERSION` | [Vector Store](configuration_options/vector-store.md) |
 | [`verify_data_after_entire_test`](configuration_options/upgrade-tests.md#verify_data_after_entire_test) | `SCT_VERIFY_DATA_AFTER_ENTIRE_TEST` | [Upgrade tests](configuration_options/upgrade-tests.md) |
