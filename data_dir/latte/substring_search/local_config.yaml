@@ -1,0 +1,154 @@
+# Tiny substring-search plan for local correctness runs.
+#
+# Used by test-cases/substring-search/substring-search-test-docker.yaml. Deliberately small: the
+# goal is to exercise every branch of SubstringSearchTest.test_substring_search, not to produce
+# meaningful performance numbers.
+#
+# Two datasets, one per way of getting the index ready, so a smoke run covers both: 'local_tiny'
+# loads then builds, 'local_ingest' indexes while it loads (the mode the AWS plan uses).
+#
+# No `base_url` -> every shard and query file is read from data_dir/latte/substring_search/<dataset>/
+# and no S3 access happens. The corpora are generated, not tracked in git, so this is a one-off
+# after a fresh clone:
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py --dataset local_ingest
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py --dataset local_shuffled \
+#       --sort-order shuffled
+datasets:
+  - name: local_tiny
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      # Single shard: simplest load path, one rate-limited query.
+      - shards: [0]
+        queries:
+          - set: char2
+            concurrency: 1
+            rate: 50
+      # Shard range: exercises _parse_shard_spec, cumulative name counts and the _drop_index of the
+      # previous step's index.
+      - shards: [1..2]
+        queries:
+          # The hot case: one character carried by a large share of the names, so the index stops
+          # at LIMIT instead of collecting every match.
+          - set: char1
+          - set: char2
+          # Longer than the default max_gram of 3, so the index intersects three-character grams and
+          # verifies each candidate. 'qrels: true' checks the answer is still exactly right.
+          - set: char4
+            qrels: true
+          - set: latin
+          # An answer with no rows in it.
+          - set: miss
+            qrels: true
+      # A rebuild on the same corpus: an empty 'shards' list makes _load_step_shards a no-op, so
+      # this step is only an index build.
+      - shards: []
+
+  # The same corpus again, indexed while it loads rather than built afterwards: the index is
+  # created before the rows are written and the run waits for its document count to reach them.
+  # No build time is reported for this dataset, by design.
+  - name: local_ingest
+    index_during_load: true
+    # Two indexes over the one load, to exercise the variant rounds: Tantivy's default merge
+    # policy, and the range-aware one capped at 500 rows per segment (segment_rows as
+    # vector-store reads it). Every query row below is reported twice, '[default]' and '[p3a]'.
+    index_variants:
+      - label: default
+        options: {segment_rows: '0'}
+      - label: p3a
+        options: {segment_rows: '500', rewrite: 'false'}
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..2]
+        queries:
+          - set: char2
+          # Ground truth over the whole corpus, which this single step has loaded in full, so
+          # recall is meaningful: it says the incremental path indexed everything, not just most.
+          - set: char4
+            qrels: true
+          - set: miss
+            qrels: true
+          # The three shapes of the same set, so the smoke run covers each once. They are separate
+          # rows rather than one: an ordered answer and a plain one are different questions.
+          - set: char2
+            ordered: true
+          # A later page, expressed as the query a cursor halfway down the order would produce.
+          # No qrels: ground truth covers the whole corpus and cannot describe a windowed answer.
+          - set: char2
+            ordered: true
+            window: 0.5
+          # A window with no ORDER BY: the range is pushed down either way, which is worth covering
+          # because it is a different restriction path from the ordered one.
+          - set: char2
+            window: 0.5
+          # Keywords past max_gram, up to the 32-character limit (the local corpora are generated
+          # with --long-names). Each matches few names; qrels on the two longest keep the
+          # intersection-and-verify path honest for the longest keywords the index will see.
+          - set: char8
+            ordered: true
+          - set: char16
+            ordered: true
+            qrels: true
+          - set: char32
+            ordered: true
+            qrels: true
+          # The other direction, and a page from its far end: the same rows come back oldest
+          # first, from a cursor the script places a fraction of the way up.
+          - set: char2
+            ordered: true
+            order: asc
+          - set: char2
+            ordered: true
+            order: asc
+            window: 0.5
+          # A prefix and a suffix are containment with the value's edge marked; the ordered
+          # suffix shape checks the anchored walk pages too.
+          - set: char2
+            match: prefix
+          - set: char2
+            match: suffix
+            ordered: true
+
+  # The backfill case: the index is created AFTER the load, so vector-store builds it by a full
+  # scan in token order and every segment spans the whole sort range whatever order the rows were
+  # written in (this corpus is shuffled on top, which changes nothing here). Two variants, both
+  # created on the loaded table: left as built, and with the range-aware merge policy plus the
+  # rewrite of wide segments (segment_rows and rewrite as vector-store reads them), which
+  # should end with narrow, capped segments. Locally this exercises the after-load variant rounds
+  # and the rewrite; the measurement is the AWS plan's.
+  - name: local_shuffled
+    index_variants:
+      - label: wide
+        options: {segment_rows: '0'}
+      # A cap of 100 on 3000 rows: a segment is wide when it spans more than eight times its share
+      # of the rows, and at a cap of 500 a 490-row segment's share is a sixth, so nothing would
+      # ever count as wide. (At 10M rows and a 100k cap the share is 1%.)
+      - label: rewrite
+        options: {segment_rows: '100', rewrite: 'true'}
+    max_index_wait_secs: 300
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 10s
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..2]
+        queries:
+          - set: char2
+            ordered: true
+          - set: char2
+            ordered: true
+            window: 0.5

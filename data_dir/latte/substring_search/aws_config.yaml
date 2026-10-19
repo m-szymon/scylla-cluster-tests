@@ -1,0 +1,160 @@
+# Substring-search plan for the AWS run: how fast containment queries are at 10M names.
+#
+# Used by test-cases/substring-search/substring-search-test.yaml. The question is query throughput
+# and latency, so the plan is shaped around the query phases and spends as little time as it can on
+# getting the data in:
+#
+#   'index_during_load: true' creates the index before the rows are written, so the index node
+#   ingests through CDC while latte is still loading and no separate full-scan build happens. The
+#   run then waits until the index holds every loaded row and until its segment count stops moving,
+#   and measures nothing about how long that took. Use aws_build_config.yaml for build timing.
+#
+# One step and five query phases: this is a feasibility check, not a test suite. What it answers is
+# whether 10M names can be searched at the target rate within the latency budget, and roughly where
+# the ceiling is. A rate gives latency at a known load; 'rate: 0' pushes until something saturates.
+# Every phase shares 'expected_p99_read_ms', so they all land in one table and read top to bottom.
+#
+# Add rates, sets or duration once the first run says the thing works at all. Deliberately absent:
+# a full rate ladder, the 'latin' set (case folding is cheap and covered by the docker run) and
+# 'miss' (an empty answer is the floor, not the question).
+#
+# Generate the two corpora once (about 190 MB each, under a minute each). They hold the same names
+# and the same sort values and differ only in which row carries which, so the second measures what
+# arrival order alone costs. A names_10M left over from a stage-1 run has no sort column and must be
+# regenerated -- the rune script refuses an ordered load against it -- and regenerating with the
+# default seed reproduces its names exactly, so stage-1 results stay a valid baseline:
+#
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_10M --names 10000000 --shards 100 --qrels-cap 0
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_10M_shuffled --names 10000000 --shards 100 --qrels-cap 0 \
+#       --sort-order shuffled
+#
+# For a cheaper first pass that exercises the whole pipeline on AWS, generate a smaller corpus into
+# its own directory and point the run at a copy of this file with the dataset name and shard list
+# changed -- 1M names load in a tenth of the time and answer most of the "does it work" questions:
+#   python3 data_dir/latte/substring_search/generate_local_dataset.py \
+#       --dataset names_1M --names 1000000 --shards 10 --qrels-cap 0
+#
+# Reading the result: if the unthrottled row's throughput is well under the target, suspect the
+# loader before the cluster and raise 'n_loaders'. A rate row whose measured throughput is below
+# the rate it asked for did not keep up, and its latency is a queueing artifact rather than a
+# reading.
+datasets:
+  - name: names_10M
+    index_during_load: true
+    # The budget for the index to catch up with the load and then settle, not for a build.
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    defaults:
+      # The search box shows 20 results per page.
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          # Two characters: the typical search-box query, and the one to judge the design by.
+          # A realistic load first, so there is a latency reading that is not near saturation.
+          - set: char2
+            concurrency: 16
+            rate: 2000
+          # The rate the design was written against.
+          - set: char2
+            concurrency: 64
+            rate: 10000
+          # Unthrottled: where it actually tops out. If this lands near the loader's own limit,
+          # the number is the loader's rather than the cluster's -- raise 'n_loaders' and repeat.
+          - set: char2
+            concurrency: 128
+          # One character: the largest answers, where stopping at LIMIT matters most. One phase,
+          # to see whether the hot case tracks the typical one or falls apart.
+          - set: char1
+            concurrency: 64
+            rate: 10000
+          # Four characters: past max_gram, so gram intersection plus verification of every
+          # candidate. The most expensive shape the index serves, so it bounds the rest.
+          - set: char4
+            concurrency: 64
+            rate: 10000
+
+          # --- ordering ------------------------------------------------------------------------
+          # The customer's actual query. Ordering removes the early stop that makes the plain
+          # query fast: instead of taking the first 20 matches the index has to find the 20
+          # highest, which costs either a walk of every match or a prune of the segments that
+          # cannot hold one.
+          #
+          # NOTE: this row is NOT compared with the plain char2 rows above to price ORDER BY. The
+          #       index picks its walk from its own 'order_by' option, not from the query, so on
+          #       this index the plain rows take the ordered walk too and the two should agree --
+          #       which is itself worth confirming. The price of ordering is this row against the
+          #       stage-1 run, which served the same names (same generator, same seed) from an
+          #       index without 'order_by': char2 at 10k offered, 9,704 op/s, 6.57 ms service time.
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          # Unthrottled, to see where ordering tops out against the plain ceiling.
+          - set: char2
+            ordered: true
+            concurrency: 128
+          # A later page: the query a cursor halfway down the order produces. Paging is the whole
+          # reason the cursor exists, and the claim is that page 50 costs what page 1 costs -- so
+          # this row should match the ordered row above. If it is slower, the cursor is not doing
+          # its job.
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          # The hot case, ordered: the largest answers are where a walk of every match hurts most,
+          # so this is where pruning either shows or does not.
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000
+
+  # The same corpus, written in an order that leaves the index no usable segment bounds.
+  #
+  # This is the open risk of the ordering design, measured rather than argued. The index prunes a
+  # segment by the range of sort values it holds, and a segment holds whatever arrived together:
+  # load the accounts oldest first and each segment is one contiguous slice of the range, so most
+  # segments cannot hold a top-20 row and are never opened. Load them in a shuffled order -- which
+  # is what a backfill by partition key, or a restore, produces -- and every segment spans nearly
+  # the whole range, nothing prunes, and an ordered query walks every match.
+  #
+  # Only the ordered rows are repeated: the plain query does not read the sort column and cannot
+  # care. If these rows match the ones above, pruning is not what is carrying the ordered query and
+  # the segment work is less urgent than the design note assumes. If they are far worse, the gap is
+  # the size of the problem P3 has to solve.
+  - name: names_10M_shuffled
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    defaults:
+      limit: 20
+      duration: 120s
+      concurrency: 32
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..99]
+        queries:
+          - set: char2
+            ordered: true
+            concurrency: 64
+            rate: 10000
+          - set: char2
+            ordered: true
+            concurrency: 128
+          - set: char2
+            ordered: true
+            window: 0.5
+            concurrency: 64
+            rate: 10000
+          - set: char1
+            ordered: true
+            concurrency: 64
+            rate: 10000
