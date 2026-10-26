@@ -461,6 +461,9 @@ class SubstringSearchTest(SearchPerformanceTest):
     _step_idx = -1
     _ingesting_index_name = ""
     _max_index_wait = DEFAULT_MAX_INDEX_WAIT
+    # Set per dataset from the plan's 'max_settle_secs': how long an index may go on merging, or
+    # rewriting, after it has caught up before the queries start anyway.
+    _max_settle = DEFAULT_SETTLE_TIMEOUT_SECS
     # The dataset's 'index_variants', the ones of the current step still standing (index name ->
     # label), and the label of the one serving the round in progress.
     _variants: list = []
@@ -480,6 +483,7 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._step_idx = -1
         self._ingesting_index_name = ""
         self._max_index_wait = dataset.get("max_index_wait_secs", DEFAULT_MAX_INDEX_WAIT)
+        self._max_settle = dataset.get("max_settle_secs", DEFAULT_SETTLE_TIMEOUT_SECS)
         self._variants = checked_index_variants(dataset)
         self._live_variants = {}
         self._variant_label = ""
@@ -806,7 +810,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         rather than failed: the queries are still worth running, they just start against a moving
         target, and the segment count in the size row says what they ran against.
         """
-        deadline = time.monotonic() + min(timeout, DEFAULT_SETTLE_TIMEOUT_SECS)
+        started = time.monotonic()
+        deadline = started + min(timeout, self._max_settle)
         previous, stable = None, 0
         while True:
             segments = self._read_index_gauge(keyspace, index_name, SEGMENT_COUNT_METRIC)
@@ -831,10 +836,20 @@ class SubstringSearchTest(SearchPerformanceTest):
             stable = stable + 1 if segments == previous and not rewriting else 0
             previous = segments
             if stable >= SETTLE_STABLE_POLLS:
-                self.log.info("Index '%s' settled at %d segments", index_name, int(segments))
+                self.log.info(
+                    "Index '%s' settled at %d segments, %.0f s after it caught up",
+                    index_name,
+                    int(segments),
+                    time.monotonic() - started,
+                )
                 return
             if time.monotonic() >= deadline:
-                self.log.warning("Index '%s' still merging at %d segments; querying anyway", index_name, int(segments))
+                self.log.warning(
+                    "Index '%s' still merging at %d segments %.0f s after it caught up; querying anyway",
+                    index_name,
+                    int(segments),
+                    time.monotonic() - started,
+                )
                 return
             time.sleep(SETTLE_POLL_INTERVAL_SECS)
 
