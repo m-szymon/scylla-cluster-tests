@@ -1,0 +1,92 @@
+# The first AWS run of the pattern-index-poc port, at 10M names. Two questions on the stage-5
+# corpus and keyword sets:
+#
+# 1. Does the port perform as the substring-index* branches did? The during_load dataset repeats
+#    the cap_200k index of run 7212926d (2026-09-30): same corpus, same phases, case-sensitive,
+#    verification on the node. The port's index differs from that one in its defaults and in the
+#    code under it -- upstream's shared tantivy code, a reader that reloads in the background, the
+#    rewrite on by default -- so a difference here is the port's.
+# 2. What does an index created on an already loaded table cost and answer, with the rewrite? It
+#    is what CREATE INDEX on an existing table gives. Stage 3 measured it once (run of 2026-09-27),
+#    before the rewrite was bounded to a cap's width of the key space (vector-store a6cfcf7),
+#    and that run's rewrite never settled; nothing has measured it since.
+#
+# Each dataset has two variants:
+#   default   no extra options: what the port does with order_by alone -- a 200k cap, the
+#             rewrite on, the node verifying
+#   cap_300k  segment_rows 300000, the rewrite still on by default: the cap between the 200k and
+#             400k of run 7212926d, which may balance 16-character keywords (better with bigger
+#             segments) against 1-character ones (worse)
+#
+# Run with the case-sensitive overlay, as run 7212926d was:
+#   --config test-cases/substring-search/substring-search-test.yaml
+#   --config test-cases/substring-search/stage5-case-sensitive.yaml
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_port_config.yaml
+# The backfill dataset's directory is the same corpus under another name:
+#   ln -s names_10M_long data_dir/latte/substring_search/names_10M_long_backfill
+#
+# What to read afterwards: the during_load default row by row against 7212926d's cap_200k; for
+# backfill, the size rows (segments, span columns, 'rewrite_ranges', and 'catch_up_secs', which is
+# the build alone) and the log's "settled ... s after it caught up" (the rewrite), and whether the
+# queries reach the during_load numbers. A "still merging ... querying anyway" line means the rows
+# measured a moving layout.
+#
+# Budget: provisioning ~20 min; the first load and ingest ~13 min (7212926d caught up 756 s after
+# the load); two rounds of 14 phases (60 s each) ~19 min each; the second load ~10 min; two builds
+# by full scan and their rewrites, unmeasured at 10M, assumed ~30 min; two more rounds ~38 min; log
+# collection ~5 min, teardown ~7 min: about 3:00, inside one Okta session if started early.
+datasets:
+  - name: names_10M_long
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    max_settle_secs: 1200
+    index_variants:
+      - label: default
+        options: {}
+      - label: cap_300k
+        options: {segment_rows: '300000'}
+    defaults: &defaults
+      limit: 20
+      duration: 60s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries: &queries
+          # capacity
+          - {set: char1, ordered: true}
+          - {set: char2, ordered: true}
+          - {set: char2, ordered: true, window: 0.5}
+          - {set: char4, ordered: true}
+          - {set: char8, ordered: true}
+          - {set: char8, ordered: true, window: 0.5}
+          - {set: char16, ordered: true}
+          - {set: char32, ordered: true}
+          - {set: miss, ordered: true}
+          # latency, below capacity
+          - {set: char2, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char4, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char8, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
+          - {set: char16, ordered: true, rate: 1000, concurrency: 16, duration: 60s}
+          - {set: char32, ordered: true, rate: 500, concurrency: 16, duration: 60s}
+
+  # The indexes are created after the load and built by a full scan in token order, so every
+  # segment the build leaves spans the whole sort range until the rewrite takes it apart.
+  - name: names_10M_long_backfill
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    # The rewrite of a 10M build is unmeasured since a6cfcf7 (100 ranges took 5 min on 2026-09-27,
+    # and did not settle); the default 600 s would start the queries on a half-rewritten index.
+    # The log line "settled at N segments, S s after it caught up" is the rewrite's time.
+    max_settle_secs: 2400
+    index_variants:
+      - label: default
+        options: {}
+      - label: cap_300k
+        options: {segment_rows: '300000'}
+    defaults: *defaults
+    steps:
+      - shards: [0..9]
+        queries: *queries

@@ -137,9 +137,9 @@ assumes. If the shuffled rows are far worse, the gap is the size of the problem.
 Whether pruning happened is reported rather than inferred from the latency. After the index
 settles, the size row carries `segment_span_mean_pct` and `segment_span_max_pct`: each segment's
 span of the sort column as a share of the whole range, from vector-store's per-segment gauges
-(`substring_segment_docs`, `substring_segment_sort_min/max`), and the test log lists every segment.
+(`pattern_segment_docs`, `pattern_segment_sort_min/max`), and the test log lists every segment.
 A mean near 100% means no segment can ever be skipped. Then every latency row carries what one
-query cost the index, from the delta of the walk totals (`substring_search_*_total`) over the phase:
+query cost the index, from the delta of the walk totals (`pattern_search_*_total`) over the phase:
 `walk_us_per_query`, `prepare_us_per_query` (the part of the walk spent reading segment bounds before
 the first posting) and `column_opens_per_query` (columns opened for it), `page_resolve_us_per_query`
 (the part spent turning the page into primary ids), `segments_considered_per_query`, `segments_opened_per_query`,
@@ -157,7 +157,9 @@ load each index held every row -- the ingestion cost of its options), the layout
 walk columns are reported per variant. Without `index_during_load` the variants are created after the
 load instead, each built by vector-store's full scan: the backfill case, where `catch_up_secs` is the
 build time and the `l0_rows` / `rewrite_ranges` columns say what the rewrite of wide segments found and
-did. The settle wait covers a rewrite in progress. The options are the pattern index's own:
+did. The settle wait covers a rewrite in progress; it lasts up to `max_settle_secs` of the dataset
+(600 by default), and the log says how long it took, which for the backfill case is the rewrite's
+cost in time. The options are the pattern index's own:
 `segment_rows` caps segment size and switches on the range-aware merge policy (200000 by default
 for an index with `order_by`; `'0'` turns it off), `rewrite` rewrites wide segments (on wherever
 there is a cap), and `verify_candidates: 'scylla'` moves the check of a long keyword's candidates
