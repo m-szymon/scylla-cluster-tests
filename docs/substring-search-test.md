@@ -329,6 +329,14 @@ A rate row whose measured throughput came in below the rate it asked for did not
 latency is a queueing artifact rather than a reading. If the unthrottled row lands well under the
 target, suspect the loader before the cluster and raise `n_loaders`.
 
+**Compare within a run, not across runs.** Two runs weeks apart on the same code have differed by
+7-21% in throughput for the same work per query (run 7212926d of 2026-09-30 against eb0023ac of
+2026-10-27): newer images, other instances, another day. The AWS test case therefore pins its four
+AMIs; move them on purpose, in a commit of their own. A question about a change is answered by
+variants of one run (`index_variants`), and a plan that is to be read against an earlier run carries
+that run's configuration as a control variant, whose difference from the earlier run is the noise
+any other difference has to exceed.
+
 The number to compare across steps is **bytes per name**: an n-gram index stores every substring of
 `min_gram..max_gram` characters of every value, so its cost per row depends on name length and
 `max_gram`, not on the row count. If 1M and 10M names disagree on it, something other than the index
