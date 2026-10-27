@@ -21,9 +21,11 @@ reads as "no measurement" rather than as an error.
 """
 
 import dataclasses
+import logging
 import re
 
 import pytest
+import requests
 import yaml
 
 # NOTE: the test class is reached through the module rather than imported by name -- pytest's
@@ -426,3 +428,54 @@ def test_the_direction_and_the_match_become_script_parameters(query, expected):
 def test_an_unknown_direction_or_match_is_refused(query):
     with pytest.raises(ValueError):
         substring_test.SubstringSearchTest.query_shape_label(None, query)
+
+
+class _FlakyStatusClient:
+    """Answers each status request from a script: an exception to raise or a count to report."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def get_index_status_or_none(self, keyspace, index):
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return {"count": answer}
+
+
+def _test_waiting_on(client, monkeypatch):
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.log = logging.getLogger("test_substring_test")
+    test.WORKLOAD = SUBSTRING_WORKLOAD
+    test._vector_store_api_client = lambda: client
+    monkeypatch.setattr(substring_test.time, "sleep", lambda _secs: None)
+    return test
+
+
+@pytest.mark.parametrize(
+    "failure", [requests.exceptions.ReadTimeout("read timed out"), requests.exceptions.ConnectionError("reset")]
+)
+def test_a_status_poll_that_gets_no_answer_is_skipped_not_fatal(failure, monkeypatch):
+    """One dropped status request is a missed sample: the wait polls on and sees the index catch up."""
+    client = _FlakyStatusClient([5, failure, 10])
+    test = _test_waiting_on(client, monkeypatch)
+    caught_up = test._wait_for_indexes_count("ks", ["idx"], 10, timeout=60)
+    assert list(caught_up) == ["idx"]
+    assert client.answers == []
+
+
+def test_the_single_index_wait_also_polls_through_a_dropped_request(monkeypatch):
+    client = _FlakyStatusClient([requests.exceptions.ReadTimeout("read timed out"), 10])
+    test = _test_waiting_on(client, monkeypatch)
+    test._wait_for_index_count("ks", "idx", 10, timeout=60)
+    assert client.answers == []
+
+
+def test_an_index_that_never_answers_still_times_out(monkeypatch):
+    """Skipping unanswered polls does not stretch the wait past its deadline."""
+    client = _FlakyStatusClient([requests.exceptions.ReadTimeout("read timed out")] * 1000)
+    test = _test_waiting_on(client, monkeypatch)
+    clock = iter(range(0, 10000, 10))
+    monkeypatch.setattr(substring_test.time, "monotonic", lambda: next(clock))
+    with pytest.raises(TimeoutError):
+        test._wait_for_indexes_count("ks", ["idx"], 10, timeout=60)
