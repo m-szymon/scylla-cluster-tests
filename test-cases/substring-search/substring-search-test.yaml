@@ -95,6 +95,17 @@ instance_type_loader: 'c5.2xlarge'
 # Raise to m8g.xlarge or r8g.xlarge if a realistic corpus turns out to need it.
 instance_type_vector_store: 'c8g.xlarge'
 
+# Pinned AMIs (eu-west-1), so that runs weeks apart measure the code and not newer images. Left to
+# SCT, every run takes the newest Ubuntu base for ScyllaDB and the newest vector-store AMI under the
+# source build, and the run of 2026-10-27 (eb0023ac), on images a month newer than the runs of late
+# September, measured the same work per query 7-21% slower with no way to tell images from AWS
+# noise. These are that run's images. Move them on purpose, in a commit of its own, and expect the
+# numbers to move with them. A run that falls back to another region re-resolves them.
+ami_id_db_scylla: 'ami-0445442ed20a2c6f8'     # ubuntu-noble-24.04-amd64-server-20261023
+ami_id_vector_store: 'ami-000a6958bb393ce5c'  # vector-store-1-14-0-arm64, replaced by the source build
+ami_id_loader: 'ami-04a5090d5908028ad'        # ubuntu-resolute-26.04-amd64-server-20261022
+ami_id_monitor: 'ami-08b1667b12dd0fe46'       # scylladb-monitor-4-16-0-amd64
+
 # Argus: left at its default so the test can report normally if it is ever run from a pipeline.
 # For a local run, turn it off per run instead:
 #   export SCT_ENABLE_ARGUS=false
