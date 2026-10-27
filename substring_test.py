@@ -36,6 +36,7 @@ import os
 import re
 import time
 
+import requests
 from argus.client.generic_result import ColumnMetadata, ResultType, StaticGenericResultTable, Status
 
 from sdcm.argus_results import submit_results_to_argus
@@ -726,6 +727,23 @@ class SubstringSearchTest(SearchPerformanceTest):
         if len(segments) > SEGMENT_LAYOUT_LOG_ROWS:
             self.log.info("  ... and %d more", len(segments) - SEGMENT_LAYOUT_LOG_ROWS)
 
+    # What _index_status answers when vector-store did not: the poll is skipped, not counted as 0.
+    UNANSWERED = object()
+
+    def _index_status(self, client, keyspace, index_name):
+        """The index's status, None while vector-store has not discovered it, or UNANSWERED.
+
+        A status request that times out or cannot connect is one missed sample, not a failed run:
+        the runner reaches the index node over the internet, and a run of several hours sees the
+        odd dropped connection (run eb0023ac lost its second half to one 30 s read timeout). The
+        caller's deadline still bounds the wait.
+        """
+        try:
+            return client.get_index_status_or_none(keyspace.lower(), index_name.lower())
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            self.log.warning("No status for index '%s' this time, polling on: %s", index_name, exc)
+            return self.UNANSWERED
+
     def _wait_for_indexes_count(self, keyspace, index_names, record_count, timeout) -> dict[str, float]:
         """Wait until every named index holds every loaded row; per index, how long after the load
         it got there.
@@ -740,7 +758,9 @@ class SubstringSearchTest(SearchPerformanceTest):
         caught_up = {}
         while pending:
             for name in list(pending):
-                status = client.get_index_status_or_none(keyspace.lower(), name.lower())
+                status = self._index_status(client, keyspace, name)
+                if status is self.UNANSWERED:
+                    continue
                 count = (status or {}).get("count", 0)
                 if count >= record_count:
                     caught_up[name] = round(max(time.monotonic() - load_end, 0.0), 1)
@@ -782,8 +802,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         deadline = time.monotonic() + timeout
         last_seen = -1
         while True:
-            status = client.get_index_status_or_none(ks, idx)
-            count = (status or {}).get("count", 0)
+            status = self._index_status(client, ks, idx)
+            count = last_seen if status is self.UNANSWERED else (status or {}).get("count", 0)
             if count >= record_count:
                 self.log.info(
                     "Index '%s' has caught up: %d of %d %s", index_name, count, record_count, self.WORKLOAD.item_noun
