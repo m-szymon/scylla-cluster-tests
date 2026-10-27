@@ -3161,7 +3161,7 @@ class BaseNode(AutoSshContainerMixin):
         # Download unified package
         self.remoter.run(
             curl_with_retry(
-                unified_package,
+                shlex.quote(unified_package),
                 follow_redirects=True,
                 fail_early=True,
                 output="./unified_package.tar.gz",

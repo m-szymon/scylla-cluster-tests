@@ -4,9 +4,6 @@ Every remoter.run("curl ...") call in SCT should use this helper
 to ensure consistent retry/timeout behaviour across the framework.
 """
 
-import shlex
-
-
 # expands to --retry-all-errors when the executing node curl supports it (curl >= 7.71)
 RETRY_ALL_ERRORS_PROBE = "$(curl --retry-all-errors --version >/dev/null 2>&1 && echo --retry-all-errors)"
 
@@ -28,7 +25,9 @@ def curl_with_retry(
     """Build a curl command string with retry and timeout flags.
 
     Args:
-        url: Target URL.
+        url: Target URL, pasted into the command verbatim: it may be a shell variable such as
+            ``"$_vector_url"``, so a caller whose URL carries shell metacharacters (the '&' of a
+            presigned S3 URL) quotes it itself.
         retry: ``--retry`` count (0 to disable retry, e.g. for localhost).
         retry_max_time: ``--retry-max-time`` in seconds.
         retry_all_errors: Retry connection resets (curl exit 35/56), which plain
@@ -66,8 +65,5 @@ def curl_with_retry(
         parts.append(f"-o {output}")
     if extra_flags:
         parts.append(extra_flags)
-    # Quoted: the result is pasted into a shell command, and a URL with a query string -- a
-    # presigned S3 URL, say -- carries '&' and '?', which the shell would act on. A URL without
-    # shell metacharacters quotes to itself, so this changes nothing for the plain case.
-    parts.append(shlex.quote(url))
+    parts.append(url)
     return " ".join(parts)

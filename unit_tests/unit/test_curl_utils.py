@@ -62,6 +62,12 @@ from sdcm.utils.curl import RETRY_ALL_ERRORS_PROBE, curl_with_retry
             "curl --connect-timeout 10 https://x.com",
         ),
         (
+            # A shell variable reaches the command unquoted, so the shell expands it.
+            '"$_vector_url"',
+            {"retry": 0},
+            'curl --connect-timeout 10 "$_vector_url"',
+        ),
+        (
             "https://x.com/vector.rpm",
             {"max_time": 600},
             f"curl --connect-timeout 10 --max-time 600 --retry 5 --retry-max-time 300 {RETRY_ALL_ERRORS_PROBE} "

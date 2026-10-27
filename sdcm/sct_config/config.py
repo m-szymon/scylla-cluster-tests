@@ -22,6 +22,7 @@ import json
 import logging
 import getpass
 import pathlib
+import shlex
 import tempfile
 import dataclasses
 from textwrap import dedent
@@ -2639,7 +2640,7 @@ class SCTConfiguration(*CONFIG_GROUPS):
                     LOCALRUNNER.run(
                         shell_script_cmd(f"""
                         cd {tmpdirname}
-                        {curl_with_retry(unified_package, output="./unified_package.tar.gz", follow_redirects=True, fail_early=True)}
+                        {curl_with_retry(shlex.quote(unified_package), output="./unified_package.tar.gz", follow_redirects=True, fail_early=True)}
                         tar xvfz ./unified_package.tar.gz
                         """),
                         verbose=False,
