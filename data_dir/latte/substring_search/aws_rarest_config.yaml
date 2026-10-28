@@ -13,10 +13,12 @@
 #   lookup.
 #
 # Every index is built while the table loads, with the port's defaults otherwise (a 200k cap, the
-# rewrite on, the node verifying). 'control_end' is the control again, queried last: its distance
-# from 'control' is the drift within one run, the yardstick for every other difference here. Its
-# rarest_grams '0' is the default (all grams); it is spelled out only so that ScyllaDB does not take
-# the index for a duplicate of 'control'.
+# rewrite on, the node verifying). Three indexes, not more: run 4c4b7647 had six (also max_gram 4
+# alone, max_gram 5 with rarest grams, and the control again at the end), and at about 5.2M names
+# each the index node (c8g.xlarge, 8 GB) began to thrash -- CPU down from ~88% to ~22%, 12 GB read
+# from its disk in five minutes, no status answers -- and the run was aborted. Three indexes at 10M
+# is what this node carried in run 7212926d. A bigger node would hold more, but the index node's CPU
+# has to stay the limit at 8 to 32 characters for the walk's cost to show.
 #
 # Run with the case-sensitive overlay, as the earlier runs were:
 #   --config test-cases/substring-search/substring-search-test.yaml
@@ -25,11 +27,10 @@
 #
 # What to read afterwards: per variant, the capacity rows at 8, 16 and 32 characters against the
 # control's, the walk and segments opened per query, the size row (bytes a name), and
-# 'catch_up_secs' (six indexes ingest at once, so each one's cost is not separable; the index
-# node's CPU during the load is).
+# 'catch_up_secs' (three indexes ingest at once, so each one's cost is not separable).
 #
-# Budget: provisioning ~20 min; load and ingest of six indexes ~30 min; six rounds of 14 phases at
-# ~21 min; log collection and teardown ~12 min: about 3:10.
+# Budget: provisioning ~20 min; load and ingest of three indexes ~30 min; three rounds of 14 phases
+# at ~21 min; log collection and teardown ~12 min: about 2:10.
 datasets:
   - name: names_10M_long
     index_during_load: true
@@ -41,14 +42,8 @@ datasets:
         options: {}
       - label: rarest
         options: {rarest_grams: '4'}
-      - label: gram4
-        options: {max_gram: '4'}
       - label: gram4_rarest
         options: {max_gram: '4', rarest_grams: '4'}
-      - label: gram5_rarest
-        options: {max_gram: '5', rarest_grams: '4'}
-      - label: control_end
-        options: {rarest_grams: '0'}
     defaults:
       limit: 20
       duration: 60s
