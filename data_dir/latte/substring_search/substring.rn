@@ -329,6 +329,9 @@ pub async fn prepare(db) {
 
             db.declare_metric("recall", "higher");
             db.declare_metric("precision", "higher");
+            if SEARCH_ORDERED {
+                db.declare_metric("order", "higher");
+            }
         }
 
         println!("Search limit: {}", SEARCH_LIMIT);
@@ -481,10 +484,10 @@ pub async fn search(db, i) {
             }
             db.record_metric("result_count", returned_ids.len() as f64);
 
-            // NOTE: ground truth covers the whole corpus, so it cannot describe a windowed
-            //       answer -- the rows below the cursor are correctly absent but count as misses.
-            //       A plan that puts 'qrels: true' on a windowed set is asking recall a question it
-            //       cannot answer; precision still means what it always did.
+            // NOTE: ground truth that covers the whole corpus cannot describe a windowed answer --
+            //       the rows below the cursor are correctly absent but count as misses. A windowed
+            //       set needs ground truth written for its window (derive_query_matrix.py writes
+            //       '<set>_w50' sets for 'window: 0.5'); precision means what it always did.
             if COMPUTE_ACCURACY {
                 let relevant_ids = [];
                 for qrel in db.data.qrels_by_query[idx] {
@@ -501,6 +504,21 @@ pub async fn search(db, i) {
                 db.record_metric("precision", exact_precision(returned_ids, relevant_ids));
                 if relevant_ids.len() > 0 {
                     db.record_metric("recall", metrics::recall_at_k(returned_ids, relevant_ids, SEARCH_LIMIT));
+                }
+                // An ordered answer has exactly one right sequence when the ground truth lists the
+                // expected page in order, as derive_query_matrix.py writes it: 1.0 for that
+                // sequence, 0.0 for anything else, including the right rows out of order.
+                if SEARCH_ORDERED {
+                    let same = returned_ids.len() == relevant_ids.len();
+                    if same {
+                        for k in 0..returned_ids.len() {
+                            if returned_ids[k] != relevant_ids[k] {
+                                same = false;
+                                break;
+                            }
+                        }
+                    }
+                    db.record_metric("order", if same { 1.0 } else { 0.0 });
                 }
             }
         }
