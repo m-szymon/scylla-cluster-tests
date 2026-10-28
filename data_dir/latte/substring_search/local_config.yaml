@@ -55,14 +55,18 @@ datasets:
   # No build time is reported for this dataset, by design.
   - name: local_ingest
     index_during_load: true
-    # Two indexes over the one load, to exercise the variant rounds: Tantivy's default merge
-    # policy, and the range-aware one capped at 500 rows per segment (segment_rows as
-    # vector-store reads it). Every query row below is reported twice, '[default]' and '[p3a]'.
+    # Three indexes over the one load, to exercise the variant rounds: Tantivy's default merge
+    # policy, the range-aware one capped at 500 rows per segment (segment_rows as vector-store
+    # reads it), and longer grams of which only the two rarest are intersected, so that the qrels
+    # of char16 and char32 check the verification catches what the left-out grams would have. A
+    # variant's max_gram replaces the run's own. Every query row below is reported three times.
     index_variants:
       - label: default
         options: {segment_rows: '0'}
       - label: p3a
         options: {segment_rows: '500', rewrite: 'false'}
+      - label: rarest
+        options: {max_gram: '4', rarest_grams: '2'}
     max_index_wait_secs: 300
     defaults:
       limit: 20

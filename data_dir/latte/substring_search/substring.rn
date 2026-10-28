@@ -129,17 +129,23 @@ const SEARCH = "search";
 /// Built by concatenation rather than by collecting into a Vec and joining: rune's Vec has no
 /// 'join', and reaching for one fails at run time with "Missing instance function for
 /// ::std::vec::Vec" rather than when the script is compiled. 'case_sensitive' is emitted last and
-/// unconditionally, so every earlier option can carry its own trailing separator.
+/// unconditionally, so every earlier option can carry its own trailing separator. An index
+/// variant's extra option replaces the run's own of the same name rather than repeating it.
 fn index_options_clause() {
     let opts = "";
-    if MIN_GRAM > 0 { opts += `'min_gram': '${MIN_GRAM}', `; }
-    if MAX_GRAM > 0 { opts += `'max_gram': '${MAX_GRAM}', `; }
+    if MIN_GRAM > 0 && !is_extra_option("min_gram") { opts += `'min_gram': '${MIN_GRAM}', `; }
+    if MAX_GRAM > 0 && !is_extra_option("max_gram") { opts += `'max_gram': '${MAX_GRAM}', `; }
     if is_ordered() { opts += `'order_by': '${ORDER_BY}', `; }
     if EXTRA_OPTION_NAME != "" { opts += `'${EXTRA_OPTION_NAME}': '${EXTRA_OPTION_VALUE}', `; }
     if EXTRA_OPTION2_NAME != "" { opts += `'${EXTRA_OPTION2_NAME}': '${EXTRA_OPTION2_VALUE}', `; }
     if EXTRA_OPTION3_NAME != "" { opts += `'${EXTRA_OPTION3_NAME}': '${EXTRA_OPTION3_VALUE}', `; }
     opts += `'case_sensitive': '${CASE_SENSITIVE}'`;
     ` WITH OPTIONS = {${opts}}`
+}
+
+/// Whether an index variant sets the option `name` itself.
+fn is_extra_option(name) {
+    EXTRA_OPTION_NAME == name || EXTRA_OPTION2_NAME == name || EXTRA_OPTION3_NAME == name
 }
 
 /// Whether this run indexes with an ordered column.
