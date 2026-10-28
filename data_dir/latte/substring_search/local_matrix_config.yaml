@@ -1,0 +1,70 @@
+# Accuracy of every query shape on a corpus the size of a real segment layout, run locally.
+#
+# The AWS plans measure speed and check only how many rows come back. This plan checks which rows
+# come back and in what order, for every shape the AWS plans measure, on 1M names of the 10M corpus
+# capped at 20k rows a segment -- about 50 segments, as many as the 10M index settles at -- so the
+# walk, the segment skip and the rewrite run as they do there.
+#
+# The corpus and its ground truth come from derive_query_matrix.py, which also adds the shapes the
+# generated sets lack (a short keyword with few matches, a long one that fills a page):
+#   python3 data_dir/latte/substring_search/derive_query_matrix.py --source names_10M_long \
+#       --dest names_1M_matrix --first-shards 1 --split 10
+# Every set is queried ordered and checked three ways: 'precision' and 'recall' against the
+# expected page, and 'order', 1.0 only for that page in that order. '<set>_w50' is the same
+# keywords with the page below the window cursor of 'window: 0.5' as ground truth. Each should be
+# exactly 1.0 for every variant (Min of each summary 0.99 or more; ~/sct-results/tools/check_accuracy.py
+# reads them from the loader logs).
+#
+# char12_common matches at most 9 names in this corpus (20-90 in the 10M one), so here it checks a
+# partial page of a long keyword rather than a full one.
+#
+# Three indexes, built while the table loads: the defaults (4 rarest grams), all grams, and
+# max_gram 4 with the defaults. Run with the docker test case, which is case-sensitive and ordered
+# like the AWS runs:
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/local_matrix_config.yaml
+datasets:
+  - name: names_1M_matrix
+    index_during_load: true
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 3600
+    max_settle_secs: 1800
+    index_variants:
+      - label: default
+        options: {segment_rows: '20000'}
+      - label: all_grams
+        options: {segment_rows: '20000', rarest_grams: '0'}
+      - label: gram4
+        options: {segment_rows: '20000', max_gram: '4'}
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 5s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char1, ordered: true, qrels: true}
+          - {set: char2, ordered: true, qrels: true}
+          - {set: char4, ordered: true, qrels: true}
+          - {set: char8, ordered: true, qrels: true}
+          - {set: char16, ordered: true, qrels: true}
+          - {set: char32, ordered: true, qrels: true}
+          - {set: miss, ordered: true, qrels: true}
+          - {set: char1_rare, ordered: true, qrels: true}
+          - {set: char2_rare, ordered: true, qrels: true}
+          - {set: char4_rare, ordered: true, qrels: true}
+          - {set: char8_common, ordered: true, qrels: true}
+          - {set: char12_common, ordered: true, qrels: true}
+          - {set: char1_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char2_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char4_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char8_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char16_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char32_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: miss_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char1_rare_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char2_rare_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char4_rare_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char8_common_w50, ordered: true, window: 0.5, qrels: true}
+          - {set: char12_common_w50, ordered: true, window: 0.5, qrels: true}
