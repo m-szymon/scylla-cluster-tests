@@ -835,7 +835,8 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
             log = node.remoter.sudo(f"tail -3 /tmp/{name}.log", ignore_status=True, verbose=False).stdout.strip()
             self.log.info("Profile %s: %s", name, log.replace("\n", " | "))
-            node.remoter.sudo(f"gzip -1 -f /tmp/{name}.data && chmod 644 /tmp/{name}.data.gz", timeout=300)
+            # One root shell for both: 'sudo a && b' would run b as the login user, on a root-owned file.
+            node.remoter.sudo(f"sh -c 'gzip -1 -f /tmp/{name}.data && chmod 644 /tmp/{name}.data.gz'", timeout=300)
             os.makedirs(dest, exist_ok=True)
             node.remoter.receive_files(src=f"/tmp/{name}.data.gz", dst=dest, timeout=600)
             node.remoter.sudo(f"rm -f /tmp/{name}.data.gz", ignore_status=True, verbose=False)
