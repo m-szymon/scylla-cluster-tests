@@ -767,7 +767,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
             extra_columns=self.search_extra_columns(),
         )
         def _do_search(self):
-            phase = self.search_phase_begin()
+            phase = self.search_phase_begin(getattr(self, "_phase_query", {}))
             files_to_stage = [
                 (os.path.join(local_ds_dir, queries_file), os.path.join(remote_ds_dir, queries_file)),
             ]
@@ -930,8 +930,10 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         """
         return SEARCH_EXTRA_COLUMNS
 
-    def search_phase_begin(self):
+    def search_phase_begin(self, query: dict):
         """Called just before a query phase's latte run; whatever it returns reaches 'search_phase_end'.
+
+        *query* is the plan's entry for the phase, so a workload can act on keys of its own.
 
         The base flow measures nothing here. A workload uses the pair to bracket the phase with
         something read off the cluster -- a counter before and after -- and turns the difference
@@ -984,6 +986,8 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                         f"Query set {qset!r} of step #{step_number} needs {needed!r}, which is not in {local_ds_dir}"
                     )
 
+            # The plan's entry for the phase, for 'search_phase_begin' to read keys of its own from.
+            self._phase_query = query
             self._run_search(
                 local_ds_dir,
                 remote_ds_dir,
