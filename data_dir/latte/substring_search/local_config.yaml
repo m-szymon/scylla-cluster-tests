@@ -91,6 +91,8 @@ datasets:
             # A CPU profile of the DB node: in a container perf cannot be had, so this covers the
             # path that reports it and measures the phase anyway; AWS is where it records.
             profile: true
+            # From every loader at once, which locally is the one.
+            all_loaders: true
           # A later page, expressed as the query a cursor halfway down the order would produce.
           # No qrels: ground truth covers the whole corpus and cannot describe a windowed answer.
           - set: char2

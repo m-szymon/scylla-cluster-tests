@@ -35,6 +35,10 @@ import substring_test
 from substring_test import (
     CPU_COLUMNS,
     DB_CPU_COLUMN,
+    DB_HOST_CPU_COLUMN,
+    DB_MAX_SHARD_COLUMN,
+    DB_SOFTIRQ_COLUMN,
+    DB_STEAL_COLUMN,
     INDEX_SIZE_METRIC,
     LOADER_CPU_COLUMN,
     VS_CPU_COLUMN,
@@ -54,6 +58,7 @@ from substring_test import (
     parse_proc_stat,
     parse_reactor_busy,
     parse_segment_layout,
+    parse_thread_states,
     segment_spans_pct,
     walk_per_query,
 )
@@ -259,30 +264,66 @@ scylla_reactor_cpu_steal_time_ms{shard="0"} 7
 """
 
 
-def test_reactor_busy_is_summed_over_shards():
-    assert parse_reactor_busy(REACTOR_SAMPLE) == (4000.0, 2)
+def test_reactor_busy_is_read_by_shard():
+    assert parse_reactor_busy(REACTOR_SAMPLE) == {"0": 1500.0, "1": 2500.0}
     assert parse_reactor_busy("") is None
 
 
-def test_proc_stat_busy_leaves_out_idle_and_iowait():
-    text = "cpu  100 10 50 800 40 0 0 0 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n"
-    assert parse_proc_stat(text) == (160.0, 1000.0)
+def test_proc_stat_splits_busy_steal_and_softirq():
+    text = "cpu  100 10 50 800 40 5 20 30 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n"
+    assert parse_proc_stat(text) == {"total": 1055.0, "busy": 215.0, "steal": 30.0, "softirq": 20.0}
     assert parse_proc_stat("intr 1 2 3") is None
 
 
+def _stat(total, busy, steal=0.0, softirq=0.0):
+    return {"total": total, "busy": busy, "steal": steal, "softirq": softirq}
+
+
 def test_cpu_is_priced_over_the_phase():
-    before = {"time": 10.0, "db": (4000.0, 2), "loader": (160.0, 1000.0), "vs": (0.0, 100.0)}
-    after = {"time": 20.0, "db": (19000.0, 2), "loader": (460.0, 2000.0)}
+    before = {
+        "time": 10.0,
+        "db": {"0": 4000.0, "1": 2000.0},
+        "db_host": _stat(1000.0, 100.0, 10.0, 5.0),
+        "loader": _stat(1000.0, 160.0),
+        "vs": _stat(100.0, 0.0),
+    }
+    after = {
+        "time": 20.0,
+        "db": {"0": 14000.0, "1": 7000.0},
+        "db_host": _stat(2000.0, 700.0, 110.0, 55.0),
+        "loader": _stat(2000.0, 460.0),
+    }
     cells = cpu_busy_pct(before, after)
-    # 15 s of reactor time over 10 s on 2 shards; 300 of 1000 jiffies; no vs reading after.
-    assert cells == {DB_CPU_COLUMN: 75.0, LOADER_CPU_COLUMN: 30.0}
+    # Shard 0 busy all 10 s, shard 1 half of them; the host 600 of 1000 jiffies, 100 stolen, 50 in
+    # softirq; the loader 300 of 1000; no vs reading after.
+    assert cells == {
+        DB_CPU_COLUMN: 75.0,
+        DB_MAX_SHARD_COLUMN: 100.0,
+        DB_HOST_CPU_COLUMN: 60.0,
+        DB_STEAL_COLUMN: 10.0,
+        DB_SOFTIRQ_COLUMN: 5.0,
+        LOADER_CPU_COLUMN: 30.0,
+    }
     assert cpu_busy_pct({}, after) == {}
-    # A changed shard count (a restart in between) is not a phase's CPU.
-    assert DB_CPU_COLUMN not in cpu_busy_pct(before, after | {"db": (19000.0, 4)})
+    # A changed set of shards (a restart in between) is not a phase's CPU.
+    assert DB_CPU_COLUMN not in cpu_busy_pct(before, after | {"db": {"0": 1.0}})
+
+
+def test_thread_states_are_read_from_the_sampler():
+    text = "tokio-rt-worker R 3.61\ntokio-rt-worker S 1.39\nsome noise\n"
+    assert parse_thread_states(text) == {"tokio-rt-worker R": 3.61, "tokio-rt-worker S": 1.39}
 
 
 def test_every_cpu_quantity_is_a_column():
-    assert {column.name for column in CPU_COLUMNS} == {DB_CPU_COLUMN, LOADER_CPU_COLUMN, VS_CPU_COLUMN}
+    assert {column.name for column in CPU_COLUMNS} == {
+        DB_CPU_COLUMN,
+        DB_MAX_SHARD_COLUMN,
+        DB_HOST_CPU_COLUMN,
+        DB_STEAL_COLUMN,
+        DB_SOFTIRQ_COLUMN,
+        LOADER_CPU_COLUMN,
+        VS_CPU_COLUMN,
+    }
 
 
 # --- index variants ------------------------------------------------------------------------------

@@ -32,6 +32,7 @@ TestConfig.init_argus_client resolves to the replay-only client instead, and eve
 JSONL into the run's logdir rather than posted -- which is how this test is normally run.
 """
 
+import base64
 import os
 import re
 import time
@@ -136,12 +137,65 @@ WALK_COLUMNS = [ColumnMetadata(name=SEARCHES_COLUMN, unit="", type=ResultType.IN
 # a phase that ScyllaDB's row reads limit from one the client or the index node limits.
 REACTOR_BUSY_METRIC = "scylla_reactor_cpu_busy_ms"
 DB_CPU_COLUMN = "db_reactor_busy_pct"
+# The busiest shard: a mean over shards hides one that is the limit.
+DB_MAX_SHARD_COLUMN = "db_reactor_max_shard_pct"
+# The DB node's CPUs as the kernel sees them: all busy time, and the parts of it that are the
+# hypervisor's (steal) and the network's (softirq), which no reactor counts as its own.
+DB_HOST_CPU_COLUMN = "db_cpu_busy_pct"
+DB_STEAL_COLUMN = "db_steal_pct"
+DB_SOFTIRQ_COLUMN = "db_softirq_pct"
 LOADER_CPU_COLUMN = "loader_cpu_busy_pct"
 VS_CPU_COLUMN = "vs_cpu_busy_pct"
 CPU_COLUMNS = [
     ColumnMetadata(name=column, unit="%", type=ResultType.FLOAT, higher_is_better=False)
-    for column in (DB_CPU_COLUMN, LOADER_CPU_COLUMN, VS_CPU_COLUMN)
+    for column in (
+        DB_CPU_COLUMN,
+        DB_MAX_SHARD_COLUMN,
+        DB_HOST_CPU_COLUMN,
+        DB_STEAL_COLUMN,
+        DB_SOFTIRQ_COLUMN,
+        LOADER_CPU_COLUMN,
+        VS_CPU_COLUMN,
+    )
 ]
+# How many of the index node's runtime threads were running, on average over a window of the
+# phase, sampled from /proc: tells a node whose workers are all busy from one waiting on something.
+VS_WORKERS_COLUMN = "vs_workers_running"
+VS_WORKER_THREAD = "tokio-rt-worker"
+VS_THREADS_COLUMNS = [ColumnMetadata(name=VS_WORKERS_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False)]
+# Run on the index node as 'sh vs_threads.sh <process name> <delay secs> <window secs> <out>': every
+# 10 ms of the window, the state of each of the process's threads, written to <out> once done as
+# '<name> <state> <average count>' lines, the names' trailing digits dropped (R running or
+# runnable, S sleeping, D in I/O). Plain sh with 'read' builtins and no pidof or pgrep, which a
+# container need not have.
+VS_THREAD_SAMPLER = r"""pid=
+for d in /proc/[0-9]*; do
+    read -r comm < "$d/comm" 2>/dev/null && [ "$comm" = "$1" ] && pid=${d#/proc/} && break
+done
+sleep "$2"
+end=$(( $(date +%s) + $3 ))
+n=0
+tmp=$(mktemp)
+while [ -n "$pid" ] && [ "$(date +%s)" -lt "$end" ]; do
+    for f in /proc/"$pid"/task/*/stat; do
+        read -r line < "$f" || continue
+        rest=${line#*\(}
+        name=${rest%\)*}
+        after=${line##*\) }
+        printf '%s|%s\n' "$name" "${after%% *}"
+    done >> "$tmp"
+    n=$((n + 1))
+    sleep 0.01
+done
+if [ -z "$pid" ]; then
+    echo "no process named $1" > "$4.tmp"
+else
+    sed 's/[0-9-]*|/|/; s/ /_/g' "$tmp" | sort | uniq -c \
+        | awk -v n="$n" '{split($2, a, "|"); printf "%s %s %.2f\n", a[1], a[2], $1 / n}' > "$4.tmp"
+fi
+rm -f "$tmp"
+mv "$4.tmp" "$4"
+"""
 # A query entry with 'profile: true' samples the DB node's CPUs during the phase: a system-wide
 # 'perf record' (as scylla-perf-collector does; 'perf report --comm scylla' narrows it), from
 # PROFILE_DELAY_SECS into the phase (past the client's start-up) for PROFILE_SECS, PROFILE_HZ
@@ -411,29 +465,35 @@ def walk_per_query(before: dict[str, float], after: dict[str, float]) -> dict[st
     return cells
 
 
-def parse_proc_stat(text: str) -> tuple[float, float] | None:
-    """(busy, total) jiffies of all CPUs from the 'cpu' line of /proc/stat, or None.
+def parse_proc_stat(text: str) -> dict[str, float] | None:
+    """Jiffies of all CPUs from the 'cpu' line of /proc/stat: total, busy, steal and softirq, or None.
 
     Busy is everything but idle and iowait; guest time is already inside user and nice.
     """
     for line in text.splitlines():
         fields = line.split()
         if fields and fields[0] == "cpu":
-            values = [float(v) for v in fields[1:9]]
+            values = [float(v) for v in fields[1:9]] + [0.0] * (8 - len(fields[1:9]))
+            user, nice, system, idle, iowait, irq, softirq, steal = values
             total = sum(values)
-            idle = values[3] + (values[4] if len(values) > 4 else 0.0)
-            return total - idle, total
+            return {"total": total, "busy": total - idle - iowait, "steal": steal, "softirq": softirq}
     return None
 
 
-def parse_reactor_busy(metrics_text: str) -> tuple[float, int] | None:
-    """The sum of ScyllaDB's per-shard reactor busy time in ms, and the number of shards, or None."""
-    total, shards = 0.0, 0
+def parse_reactor_busy(metrics_text: str) -> dict[str, float] | None:
+    """ScyllaDB's reactor busy time in ms by shard, or None."""
+    shards = {}
     for line in metrics_text.splitlines():
         if line.startswith((REACTOR_BUSY_METRIC + "{", REACTOR_BUSY_METRIC + " ")):
-            total += float(line.rsplit(None, 1)[1])
-            shards += 1
-    return (total, shards) if shards else None
+            shard = re.search(r'shard="(\d+)"', line)
+            shards[shard.group(1) if shard else str(len(shards))] = float(line.rsplit(None, 1)[1])
+    return shards or None
+
+
+def _stat_share(before: dict | None, after: dict | None, field: str) -> float | None:
+    if not before or not after or after["total"] <= before["total"]:
+        return None
+    return round(100.0 * (after[field] - before[field]) / (after["total"] - before["total"]), 1)
 
 
 def cpu_busy_pct(before: dict, after: dict) -> dict[str, float]:
@@ -441,13 +501,31 @@ def cpu_busy_pct(before: dict, after: dict) -> dict[str, float]:
     cells = {}
     elapsed_ms = 1000.0 * (after.get("time", 0.0) - before.get("time", 0.0))
     db_before, db_after = before.get("db"), after.get("db")
-    if db_before and db_after and elapsed_ms > 0 and db_after[1] == db_before[1]:
-        cells[DB_CPU_COLUMN] = round(100.0 * (db_after[0] - db_before[0]) / (elapsed_ms * db_after[1]), 1)
-    for column, key in ((LOADER_CPU_COLUMN, "loader"), (VS_CPU_COLUMN, "vs")):
-        b, a = before.get(key), after.get(key)
-        if b and a and a[1] > b[1]:
-            cells[column] = round(100.0 * (a[0] - b[0]) / (a[1] - b[1]), 1)
+    if db_before and db_after and elapsed_ms > 0 and db_after.keys() == db_before.keys():
+        shares = [100.0 * (db_after[shard] - db_before[shard]) / elapsed_ms for shard in db_after]
+        cells[DB_CPU_COLUMN] = round(sum(shares) / len(shares), 1)
+        cells[DB_MAX_SHARD_COLUMN] = round(max(shares), 1)
+    for column, key, field in (
+        (DB_HOST_CPU_COLUMN, "db_host", "busy"),
+        (DB_STEAL_COLUMN, "db_host", "steal"),
+        (DB_SOFTIRQ_COLUMN, "db_host", "softirq"),
+        (LOADER_CPU_COLUMN, "loader", "busy"),
+        (VS_CPU_COLUMN, "vs", "busy"),
+    ):
+        share = _stat_share(before.get(key), after.get(key), field)
+        if share is not None:
+            cells[column] = share
     return cells
+
+
+def parse_thread_states(text: str) -> dict[str, float]:
+    """'<thread name> <state> <average threads>' lines of the index node's sampler, as a mapping."""
+    states = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 3:
+            states[f"{fields[0]} {fields[1]}"] = float(fields[2])
+    return states
 
 
 class SubstringSearchTest(SearchPerformanceTest):
@@ -721,28 +799,34 @@ class SubstringSearchTest(SearchPerformanceTest):
         super()._drop_index(index_name, keyspace, max_index_wait)
 
     def search_extra_columns(self):
-        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS
+        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS + VS_THREADS_COLUMNS
 
     def search_phase_begin(self, query: dict):
-        profile = self._start_profile(query) if query.get("profile") else None
-        return self._scrape_walk_totals(), self._scrape_cpu(), profile
+        # 'all_loaders: true' runs the phase from every loader at once: a second client, to tell a
+        # limit of the client from one of the cluster.
+        self._fan_out = bool(query.get("all_loaders", False))
+        profiles = self._start_profiles(query) if query.get("profile") else []
+        sampler = self._start_thread_sampler()
+        return self._scrape_walk_totals(), self._scrape_cpu(), profiles, sampler
 
     def search_phase_end(self, phase) -> dict:
         """What one query of the phase cost the index, and how busy each node was during it.
 
         The walk totals count every search the index served, so they also see whatever else queried
         it meanwhile -- nothing does in this flow. The CPU covers the whole latte run, its start-up
-        included. A scrape that failed on either side leaves the cells empty rather than reporting a
-        delta against nothing.
+        included; the index node's thread states a window inside it. A scrape that failed on either
+        side leaves the cells empty rather than reporting a delta against nothing.
         """
-        walk_before, cpu_before, profile = phase
+        self._fan_out = False
+        walk_before, cpu_before, profiles, sampler = phase
         cpu = cpu_busy_pct(cpu_before, self._scrape_cpu())
         if cpu:
             self.log.info(
                 "CPU busy over the phase: %s", ", ".join(f"{column}={value}" for column, value in cpu.items())
             )
-        if profile:
-            self._collect_profile(profile)
+        cpu |= self._collect_thread_sampler(sampler)
+        for node, name in profiles:
+            self._collect_profile(node, name)
         after = self._scrape_walk_totals()
         if walk_before is None or after is None:
             return cpu
@@ -756,23 +840,81 @@ class SubstringSearchTest(SearchPerformanceTest):
             self.log.warning("The index served no searches during the phase; no per-query cost to report")
         return cells | cpu
 
+    def _run_latte(self, stress_cmd, files_to_stage=None, **kwargs):
+        """One loader per command, as the base runs it, except in an 'all_loaders' phase."""
+        if not getattr(self, "_fan_out", False):
+            return super()._run_latte(stress_cmd, files_to_stage, **kwargs)
+        thread = self.run_latte_thread(
+            stress_cmd=stress_cmd, extra_files_to_stage=files_to_stage or [], round_robin=False, **kwargs
+        )
+        self.verify_stress_thread(thread)
+        return thread
+
+    def _start_thread_sampler(self) -> str | None:
+        """Sample the index node's thread states in the background; the output file, or None."""
+        node = self._vector_store_node()
+        self._sampler_count = getattr(self, "_sampler_count", 0) + 1
+        out = f"/tmp/vs-threads-{self._sampler_count:02d}.txt"
+        try:
+            if not getattr(self, "_sampler_installed", False):
+                script = base64.b64encode(VS_THREAD_SAMPLER.encode()).decode()
+                node.remoter.run(f"echo {script} | base64 -d > /tmp/vs_threads.sh", verbose=False, timeout=30)
+                self._sampler_installed = True
+            node.remoter.run(
+                f"rm -f {out}; setsid sh /tmp/vs_threads.sh vector-store {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
+                f"> /dev/null 2>&1 < /dev/null &",
+                verbose=False,
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
+            self.log.warning("Could not start the index node's thread sampler: %s", exc)
+            return None
+        return out
+
+    def _collect_thread_sampler(self, out: str | None) -> dict:
+        """The VS_THREADS_COLUMNS cell from the sampler's output, waiting for it if need be."""
+        if out is None:
+            return {}
+        node = self._vector_store_node()
+        try:
+            node.remoter.run(
+                f"timeout {PROFILE_DELAY_SECS + PROFILE_SECS + 30} sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
+                ignore_status=True,
+                verbose=False,
+                timeout=PROFILE_DELAY_SECS + PROFILE_SECS + 60,
+            )
+            text = node.remoter.run(f"cat {out}", ignore_status=True, verbose=False, timeout=30).stdout
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
+            self.log.warning("Could not read the index node's thread states: %s", exc)
+            return {}
+        states = parse_thread_states(text)
+        if not states:
+            self.log.warning("The index node's thread sampler said: %s", text.strip()[:300])
+            return {}
+        self.log.info(
+            "Index node threads (average count by name and state): %s",
+            ", ".join(f"{key}={value}" for key, value in sorted(states.items())),
+        )
+        return {VS_WORKERS_COLUMN: states.get(f"{VS_WORKER_THREAD} R", 0.0)}
+
     def _perf_ready(self, node) -> bool:
         """Whether 'perf' runs on the node, installing it the first time it is asked for.
 
-        Asked once per run: a node where it cannot be had (a container, a kernel with no tools
-        package) is reported once and the profiles of the run skipped, not the run failed.
+        Asked once per node and run: a node where it cannot be had (a container, a kernel with no
+        tools package) is reported once and its profiles skipped, not the run failed.
         """
-        if getattr(self, "_perf_available", None) is None:
+        available = self.__dict__.setdefault("_perf_available", {})
+        if node.name not in available:
             try:
                 if not node.remoter.sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
                     self._install_perf(node)
-                self._perf_available = node.remoter.sudo("perf --version", ignore_status=True, timeout=30).ok
+                available[node.name] = node.remoter.sudo("perf --version", ignore_status=True, timeout=30).ok
             except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
                 self.log.warning("Could not install perf on %s: %s", node.name, exc)
-                self._perf_available = False
-            if not self._perf_available:
-                self.log.warning("perf does not run on %s; the run's profiles are skipped", node.name)
-        return self._perf_available
+                available[node.name] = False
+            if not available[node.name]:
+                self.log.warning("perf does not run on %s; its profiles are skipped", node.name)
+        return available[node.name]
 
     @staticmethod
     def _install_perf(node) -> None:
@@ -798,13 +940,22 @@ class SubstringSearchTest(SearchPerformanceTest):
             retry=2,
         )
 
-    def _start_profile(self, query: dict) -> str | None:
-        """Start sampling the scylla process in the background; the recording's name, or None."""
-        node = self.db_cluster.nodes[0]
-        if not self._perf_ready(node):
-            return None
+    def _start_profiles(self, query: dict) -> list:
+        """Start sampling the DB node and the index node; the (node, recording) pairs started."""
         self._profile_count = getattr(self, "_profile_count", 0) + 1
-        name = f"perf-{self._profile_count:02d}-{_checked_name(query['set'], 'query set name')}"
+        base = f"perf-{self._profile_count:02d}-{_checked_name(query['set'], 'query set name')}"
+        started = []
+        for node, side in ((self.db_cluster.nodes[0], "db"), (self._vector_store_node(), "vs")):
+            name = f"{base}-{side}"
+            if self._perf_ready(node) and self._start_profile(node, name):
+                started.append((node, name))
+        if started:
+            self.log.info("Profiling for %s as %s", query, ", ".join(name for _, name in started))
+        return started
+
+    @staticmethod
+    def _start_profile(node, name: str) -> bool:
+        """Start a system-wide recording on the node in the background."""
         record = (
             f"sleep {PROFILE_DELAY_SECS}; perf record -a -e cpu-clock -F {PROFILE_HZ} "
             f"--call-graph dwarf,{PROFILE_STACK_BYTES} -o /tmp/{name}.data -- sleep {PROFILE_SECS}"
@@ -813,15 +964,12 @@ class SubstringSearchTest(SearchPerformanceTest):
             node.remoter.sudo(
                 f"setsid sh -c '{record}' > /tmp/{name}.log 2>&1 < /dev/null &", verbose=False, timeout=30
             )
-        except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
-            self.log.warning("Could not start profile %s: %s", name, exc)
-            return None
-        self.log.info("Profiling ScyllaDB for %s as %s", query, name)
-        return name
+        except Exception:  # noqa: BLE001 - a profile is an extra, not the measurement
+            return False
+        return True
 
-    def _collect_profile(self, name: str) -> None:
+    def _collect_profile(self, node, name: str) -> None:
         """Wait for the recording to end, then gzip it and bring it to '<logdir>/perf/'."""
-        node = self.db_cluster.nodes[0]
         dest = os.path.join(self.logdir, "perf")
         # '[p]erf-...' so that the pattern does not match the waiting shell's own command line.
         pattern = f"/tmp/[{name[0]}]{name[1:]}.data"
@@ -844,13 +992,14 @@ class SubstringSearchTest(SearchPerformanceTest):
             self.log.warning("Could not collect profile %s: %s", name, exc)
 
     def _scrape_cpu(self) -> dict:
-        """ScyllaDB's reactor busy total and the loader's and index node's /proc/stat, now.
+        """ScyllaDB's reactor busy times and the DB, loader and index nodes' /proc/stat, now.
 
         Each part is left out when its read fails, which must not end the run.
         """
         reading = {"time": time.monotonic()}
         reads = (
             ("db", lambda: self.db_cluster.nodes[0], "curl -s http://localhost:9180/metrics", parse_reactor_busy),
+            ("db_host", lambda: self.db_cluster.nodes[0], "head -1 /proc/stat", parse_proc_stat),
             ("loader", lambda: self.loaders.nodes[0], "head -1 /proc/stat", parse_proc_stat),
             ("vs", self._vector_store_node, "head -1 /proc/stat", parse_proc_stat),
         )
