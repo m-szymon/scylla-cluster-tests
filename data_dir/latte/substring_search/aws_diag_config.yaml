@@ -1,0 +1,56 @@
+# Where 1-4 character queries wait on AWS.
+#
+# Run 183abbce (release build, scylladb 4dab284d0e, aws_release_matrix_config.yaml) put 1, 2 and 4
+# characters at ~18k queries a second whatever the concurrency (64, 128 and 256 all gave 17-18k),
+# with no node's CPU saturated: ScyllaDB's reactors at most ~54% busy on average, the index node at
+# most ~57%, the loader at 4%. So queries wait 3-6 ms somewhere that is not a CPU. Locally the same
+# shapes saturate ScyllaDB (80-96% per shard), which says the cause is in what AWS adds: the
+# network between the nodes, the instances' CPUs, or the client on its own machine.
+#
+# Every row now carries, besides q/s and latency:
+# - db_reactor_busy_pct and db_reactor_max_shard_pct: ScyllaDB's shards on average and the
+#   busiest one -- a mean hides one shard that is the limit;
+# - db_cpu_busy_pct, db_steal_pct, db_softirq_pct: the DB node's CPUs as the kernel sees them,
+#   including what the hypervisor takes and what network interrupts take, which no reactor counts;
+# - vs_workers_running: how many of the index node's runtime threads were running, on average
+#   over 20 s of the phase -- all of them busy, or waiting on something;
+# - loader_cpu_busy_pct and vs_cpu_busy_pct as before.
+# The four 'profile: true' phases record CPU profiles of both the DB node and the index node.
+# The two 'all_loaders: true' phases run the same query from both loaders at once: if the cluster
+# answers twice as much, the limit was the client.
+#
+# One index, the defaults, built while the table loads. Run with two loaders and the release
+# package:
+#   SCT_N_LOADERS=2 MODE=release PKG=<scylla-unified-...4dab284d0e17...> PLAN=aws_diag_config \
+#     port_aws_chain.sh
+#
+# Budget: provisioning ~20 min; load and ingest ~20 min; 10 phases at ~1.7 min ~17 min, plus ~8 min
+# for the profiles of two nodes; log collection and teardown ~12 min: about 1:20.
+datasets:
+  - name: names_10M_matrix
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    max_settle_secs: 1800
+    index_variants:
+      - label: default
+        options: {}
+    defaults:
+      limit: 20
+      duration: 60s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2, ordered: true, profile: true}
+          - {set: char2, ordered: true, concurrency: 256}
+          - {set: char2, ordered: true, all_loaders: true}
+          - {set: char1, ordered: true}
+          - {set: char4, ordered: true}
+          - {set: char2, ordered: true, limit: 1, profile: true}
+          - {set: miss, ordered: true, profile: true}
+          - {set: miss, ordered: true, all_loaders: true}
+          - {set: char8_common, ordered: true, profile: true}
+          - {set: char32, ordered: true}
