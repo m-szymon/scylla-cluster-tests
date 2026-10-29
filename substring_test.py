@@ -131,6 +131,17 @@ WALK_COLUMNS = [ColumnMetadata(name=SEARCHES_COLUMN, unit="", type=ResultType.IN
     )
     for column in WALK_PER_QUERY_METRICS
 ]
+# Where a query phase's time went, per node: ScyllaDB's reactors busy (out of all its shards), and
+# the loader's and the index node's CPUs busy (out of all their CPUs), averaged over the phase. Tells
+# a phase that ScyllaDB's row reads limit from one the client or the index node limits.
+REACTOR_BUSY_METRIC = "scylla_reactor_cpu_busy_ms"
+DB_CPU_COLUMN = "db_reactor_busy_pct"
+LOADER_CPU_COLUMN = "loader_cpu_busy_pct"
+VS_CPU_COLUMN = "vs_cpu_busy_pct"
+CPU_COLUMNS = [
+    ColumnMetadata(name=column, unit="%", type=ResultType.FLOAT, higher_is_better=False)
+    for column in (DB_CPU_COLUMN, LOADER_CPU_COLUMN, VS_CPU_COLUMN)
+]
 # How many segments the layout log lists in full; the summary columns cover the rest.
 SEGMENT_LAYOUT_LOG_ROWS = 64
 _METRIC_LINE_RE_TEMPLATE = r"^{metric}\{{(?P<labels>[^}}]*)\}}\s+(?P<value>[0-9.eE+-]+)\s*$"
@@ -386,6 +397,45 @@ def walk_per_query(before: dict[str, float], after: dict[str, float]) -> dict[st
     for column, (metric, scale) in WALK_PER_QUERY_METRICS.items():
         if metric in after and metric in before:
             cells[column] = round(scale * (after[metric] - before[metric]) / searches, 3)
+    return cells
+
+
+def parse_proc_stat(text: str) -> tuple[float, float] | None:
+    """(busy, total) jiffies of all CPUs from the 'cpu' line of /proc/stat, or None.
+
+    Busy is everything but idle and iowait; guest time is already inside user and nice.
+    """
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "cpu":
+            values = [float(v) for v in fields[1:9]]
+            total = sum(values)
+            idle = values[3] + (values[4] if len(values) > 4 else 0.0)
+            return total - idle, total
+    return None
+
+
+def parse_reactor_busy(metrics_text: str) -> tuple[float, int] | None:
+    """The sum of ScyllaDB's per-shard reactor busy time in ms, and the number of shards, or None."""
+    total, shards = 0.0, 0
+    for line in metrics_text.splitlines():
+        if line.startswith((REACTOR_BUSY_METRIC + "{", REACTOR_BUSY_METRIC + " ")):
+            total += float(line.rsplit(None, 1)[1])
+            shards += 1
+    return (total, shards) if shards else None
+
+
+def cpu_busy_pct(before: dict, after: dict) -> dict[str, float]:
+    """The CPU_COLUMNS cells for a phase, from two '_scrape_cpu' readings; a missing side, no cell."""
+    cells = {}
+    elapsed_ms = 1000.0 * (after.get("time", 0.0) - before.get("time", 0.0))
+    db_before, db_after = before.get("db"), after.get("db")
+    if db_before and db_after and elapsed_ms > 0 and db_after[1] == db_before[1]:
+        cells[DB_CPU_COLUMN] = round(100.0 * (db_after[0] - db_before[0]) / (elapsed_ms * db_after[1]), 1)
+    for column, key in ((LOADER_CPU_COLUMN, "loader"), (VS_CPU_COLUMN, "vs")):
+        b, a = before.get(key), after.get(key)
+        if b and a and a[1] > b[1]:
+            cells[column] = round(100.0 * (a[0] - b[0]) / (a[1] - b[1]), 1)
     return cells
 
 
@@ -660,22 +710,29 @@ class SubstringSearchTest(SearchPerformanceTest):
         super()._drop_index(index_name, keyspace, max_index_wait)
 
     def search_extra_columns(self):
-        return super().search_extra_columns() + WALK_COLUMNS
+        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS
 
     def search_phase_begin(self):
-        return self._scrape_walk_totals()
+        return self._scrape_walk_totals(), self._scrape_cpu()
 
     def search_phase_end(self, phase) -> dict:
-        """What one query of the phase cost the index, from the walk totals before and after it.
+        """What one query of the phase cost the index, and how busy each node was during it.
 
-        The totals count every search the index served, so they also see whatever else queried it
-        meanwhile -- nothing does in this flow. A scrape that failed on either side leaves the cells
-        empty rather than reporting a delta against nothing.
+        The walk totals count every search the index served, so they also see whatever else queried
+        it meanwhile -- nothing does in this flow. The CPU covers the whole latte run, its start-up
+        included. A scrape that failed on either side leaves the cells empty rather than reporting a
+        delta against nothing.
         """
+        walk_before, cpu_before = phase
+        cpu = cpu_busy_pct(cpu_before, self._scrape_cpu())
+        if cpu:
+            self.log.info(
+                "CPU busy over the phase: %s", ", ".join(f"{column}={value}" for column, value in cpu.items())
+            )
         after = self._scrape_walk_totals()
-        if phase is None or after is None:
-            return {}
-        cells = walk_per_query(phase, after)
+        if walk_before is None or after is None:
+            return cpu
+        cells = walk_per_query(walk_before, after)
         if cells:
             self.log.info(
                 "Index work per query: %s",
@@ -683,7 +740,29 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
         else:
             self.log.warning("The index served no searches during the phase; no per-query cost to report")
-        return cells
+        return cells | cpu
+
+    def _scrape_cpu(self) -> dict:
+        """ScyllaDB's reactor busy total and the loader's and index node's /proc/stat, now.
+
+        Each part is left out when its read fails, which must not end the run.
+        """
+        reading = {"time": time.monotonic()}
+        reads = (
+            ("db", lambda: self.db_cluster.nodes[0], "curl -s http://localhost:9180/metrics", parse_reactor_busy),
+            ("loader", lambda: self.loaders.nodes[0], "head -1 /proc/stat", parse_proc_stat),
+            ("vs", self._vector_store_node, "head -1 /proc/stat", parse_proc_stat),
+        )
+        for key, node, cmd, parse in reads:
+            try:
+                result = node().remoter.run(cmd, ignore_status=True, verbose=False, timeout=30)
+                value = parse(result.stdout) if result.ok else None
+            except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
+                self.log.warning("Could not read the %s CPU: %s", key, exc)
+                value = None
+            if value is not None:
+                reading[key] = value
+        return reading
 
     def _scrape_walk_totals(self) -> dict[str, float] | None:
         """The index's search totals now, or None if there is no index or the scrape failed."""

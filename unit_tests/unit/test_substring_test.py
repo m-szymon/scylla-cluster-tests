@@ -33,7 +33,11 @@ import yaml
 #       and 'SubstringSearchTest' is one through ClusterTester.
 import substring_test
 from substring_test import (
+    CPU_COLUMNS,
+    DB_CPU_COLUMN,
     INDEX_SIZE_METRIC,
+    LOADER_CPU_COLUMN,
+    VS_CPU_COLUMN,
     SEARCHES_COLUMN,
     SEARCHES_METRIC,
     SEGMENT_COUNT_METRIC,
@@ -44,8 +48,11 @@ from substring_test import (
     WITH_INDEX_PARAM,
     SubstringIndexBuildResult,
     checked_index_variants,
+    cpu_busy_pct,
     index_option_params,
     parse_index_gauge,
+    parse_proc_stat,
+    parse_reactor_busy,
     parse_segment_layout,
     segment_spans_pct,
     walk_per_query,
@@ -241,6 +248,41 @@ def test_a_phase_that_reached_no_search_is_not_priced():
 def test_every_priced_quantity_is_a_column():
     names = {column.name for column in WALK_COLUMNS}
     assert names == {SEARCHES_COLUMN, *WALK_PER_QUERY_METRICS}
+
+
+REACTOR_SAMPLE = """\
+# HELP scylla_reactor_cpu_busy_ms Total cpu busy time in milliseconds
+# TYPE scylla_reactor_cpu_busy_ms counter
+scylla_reactor_cpu_busy_ms{shard="0"} 1500
+scylla_reactor_cpu_busy_ms{shard="1"} 2500
+scylla_reactor_cpu_steal_time_ms{shard="0"} 7
+"""
+
+
+def test_reactor_busy_is_summed_over_shards():
+    assert parse_reactor_busy(REACTOR_SAMPLE) == (4000.0, 2)
+    assert parse_reactor_busy("") is None
+
+
+def test_proc_stat_busy_leaves_out_idle_and_iowait():
+    text = "cpu  100 10 50 800 40 0 0 0 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n"
+    assert parse_proc_stat(text) == (160.0, 1000.0)
+    assert parse_proc_stat("intr 1 2 3") is None
+
+
+def test_cpu_is_priced_over_the_phase():
+    before = {"time": 10.0, "db": (4000.0, 2), "loader": (160.0, 1000.0), "vs": (0.0, 100.0)}
+    after = {"time": 20.0, "db": (19000.0, 2), "loader": (460.0, 2000.0)}
+    cells = cpu_busy_pct(before, after)
+    # 15 s of reactor time over 10 s on 2 shards; 300 of 1000 jiffies; no vs reading after.
+    assert cells == {DB_CPU_COLUMN: 75.0, LOADER_CPU_COLUMN: 30.0}
+    assert cpu_busy_pct({}, after) == {}
+    # A changed shard count (a restart in between) is not a phase's CPU.
+    assert DB_CPU_COLUMN not in cpu_busy_pct(before, after | {"db": (19000.0, 4)})
+
+
+def test_every_cpu_quantity_is_a_column():
+    assert {column.name for column in CPU_COLUMNS} == {DB_CPU_COLUMN, LOADER_CPU_COLUMN, VS_CPU_COLUMN}
 
 
 # --- index variants ------------------------------------------------------------------------------
