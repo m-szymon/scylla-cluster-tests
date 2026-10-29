@@ -521,3 +521,34 @@ def test_an_index_that_never_answers_still_times_out(monkeypatch):
     monkeypatch.setattr(substring_test.time, "monotonic", lambda: next(clock))
     with pytest.raises(TimeoutError):
         test._wait_for_indexes_count("ks", ["idx"], 10, timeout=60)
+
+
+class _FakeRemoter:
+    def __init__(self, has_apt):
+        self.has_apt = has_apt
+        self.sudo_cmds = []
+
+    def run(self, cmd, **_):
+        if cmd == "command -v apt-get":
+            return dataclasses.make_dataclass("R", [("ok", bool)])(self.has_apt)
+        return dataclasses.make_dataclass("R", [("stdout", str)])("6.8.0-1017-aws\n")
+
+    def sudo(self, cmd, **kwargs):
+        self.sudo_cmds.append((cmd, kwargs))
+
+
+def test_perf_is_installed_with_bounded_apt_calls():
+    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=True))
+    substring_test.SubstringSearchTest._install_perf(node)
+    update, install = node.remoter.sudo_cmds
+    assert "Acquire::http::Timeout=60" in update[0] and update[1]["timeout"]
+    assert install[0].startswith("DEBIAN_FRONTEND=noninteractive apt-get install")
+    assert "DPkg::Lock::Timeout=120" in install[0]
+    assert install[0].endswith("-y linux-tools-6.8.0-1017-aws linux-tools-common")
+    assert install[1]["timeout"] and install[1]["ignore_status"]
+
+
+def test_perf_is_not_installed_without_apt():
+    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=False))
+    substring_test.SubstringSearchTest._install_perf(node)
+    assert node.remoter.sudo_cmds == []

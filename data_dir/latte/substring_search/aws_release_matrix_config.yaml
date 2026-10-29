@@ -14,7 +14,11 @@
 # - whether 2 characters are saturated or latency-bound: the same set at concurrency 128 and 256;
 # - the cost of a row against the cost of a query: the same set at LIMIT 1, 5 and 50;
 # - where the time goes: every row carries db_reactor_busy_pct, loader_cpu_busy_pct and
-#   vs_cpu_busy_pct, averaged over the phase.
+#   vs_cpu_busy_pct, averaged over the phase;
+# - where ScyllaDB's time goes: the four 'profile: true' phases (char2 at LIMIT 20 and 1,
+#   char8_common, miss) record a CPU profile of the DB node, collected to <logdir>/perf/ and read
+#   against the unstripped build/release/scylla (same build id). Installing perf on the node at the
+#   first of them adds a minute.
 #
 # One index, the defaults (4 rarest grams), built while the table loads. Its accuracy is checked
 # locally, not here (local_matrix_config.yaml): computing it here would spend the loader's CPU.
@@ -28,8 +32,8 @@
 #   --config test-cases/substring-search/stage5-case-sensitive.yaml
 #   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/aws_release_matrix_config.yaml
 #
-# Budget: provisioning ~20 min; load and ingest of one index ~25 min; 20 phases at ~1.6 min ~32 min;
-# log collection and teardown ~12 min: about 1:30.
+# Budget: provisioning ~20 min; load and ingest of one index ~25 min; 20 phases at ~1.6 min ~32 min,
+# plus ~5 min for the profiles; log collection and teardown ~12 min: about 1:35.
 datasets:
   - name: names_10M_matrix
     index_during_load: true
@@ -50,23 +54,23 @@ datasets:
         queries:
           # capacity, the sets the earlier runs measured
           - {set: char1, ordered: true}
-          - {set: char2, ordered: true}
+          - {set: char2, ordered: true, profile: true}
           - {set: char4, ordered: true}
           - {set: char8, ordered: true}
           - {set: char16, ordered: true}
           - {set: char32, ordered: true}
-          - {set: miss, ordered: true}
+          - {set: miss, ordered: true, profile: true}
           # capacity, the new corners: short and rare, long and common
           - {set: char1_rare, ordered: true}
           - {set: char2_rare, ordered: true}
           - {set: char4_rare, ordered: true}
-          - {set: char8_common, ordered: true}
+          - {set: char8_common, ordered: true, profile: true}
           - {set: char12_common, ordered: true}
           # saturated or latency-bound
           - {set: char2, ordered: true, concurrency: 128}
           - {set: char2, ordered: true, concurrency: 256}
           # cost of a row against cost of a query
-          - {set: char2, ordered: true, limit: 1}
+          - {set: char2, ordered: true, limit: 1, profile: true}
           - {set: char2, ordered: true, limit: 5}
           - {set: char2, ordered: true, limit: 50}
           # latency, below capacity

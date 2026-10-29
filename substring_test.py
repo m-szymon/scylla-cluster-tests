@@ -142,6 +142,17 @@ CPU_COLUMNS = [
     ColumnMetadata(name=column, unit="%", type=ResultType.FLOAT, higher_is_better=False)
     for column in (DB_CPU_COLUMN, LOADER_CPU_COLUMN, VS_CPU_COLUMN)
 ]
+# A query entry with 'profile: true' samples the DB node's CPUs during the phase: a system-wide
+# 'perf record' (as scylla-perf-collector does; 'perf report --comm scylla' narrows it), from
+# PROFILE_DELAY_SECS into the phase (past the client's start-up) for PROFILE_SECS, PROFILE_HZ
+# samples a second per CPU of the cpu-clock timer -- an EC2 VM exposes no hardware cycle counter --
+# with DWARF call stacks, since a release build keeps no frame pointers. The recording is gzipped
+# and collected to '<logdir>/perf/'; the node's binary is stripped, so it is read against the
+# unstripped build with the same build id.
+PROFILE_DELAY_SECS = 10
+PROFILE_SECS = 20
+PROFILE_HZ = 99
+PROFILE_STACK_BYTES = 8192
 # How many segments the layout log lists in full; the summary columns cover the rest.
 SEGMENT_LAYOUT_LOG_ROWS = 64
 _METRIC_LINE_RE_TEMPLATE = r"^{metric}\{{(?P<labels>[^}}]*)\}}\s+(?P<value>[0-9.eE+-]+)\s*$"
@@ -712,8 +723,9 @@ class SubstringSearchTest(SearchPerformanceTest):
     def search_extra_columns(self):
         return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS
 
-    def search_phase_begin(self):
-        return self._scrape_walk_totals(), self._scrape_cpu()
+    def search_phase_begin(self, query: dict):
+        profile = self._start_profile(query) if query.get("profile") else None
+        return self._scrape_walk_totals(), self._scrape_cpu(), profile
 
     def search_phase_end(self, phase) -> dict:
         """What one query of the phase cost the index, and how busy each node was during it.
@@ -723,12 +735,14 @@ class SubstringSearchTest(SearchPerformanceTest):
         included. A scrape that failed on either side leaves the cells empty rather than reporting a
         delta against nothing.
         """
-        walk_before, cpu_before = phase
+        walk_before, cpu_before, profile = phase
         cpu = cpu_busy_pct(cpu_before, self._scrape_cpu())
         if cpu:
             self.log.info(
                 "CPU busy over the phase: %s", ", ".join(f"{column}={value}" for column, value in cpu.items())
             )
+        if profile:
+            self._collect_profile(profile)
         after = self._scrape_walk_totals()
         if walk_before is None or after is None:
             return cpu
@@ -741,6 +755,92 @@ class SubstringSearchTest(SearchPerformanceTest):
         else:
             self.log.warning("The index served no searches during the phase; no per-query cost to report")
         return cells | cpu
+
+    def _perf_ready(self, node) -> bool:
+        """Whether 'perf' runs on the node, installing it the first time it is asked for.
+
+        Asked once per run: a node where it cannot be had (a container, a kernel with no tools
+        package) is reported once and the profiles of the run skipped, not the run failed.
+        """
+        if getattr(self, "_perf_available", None) is None:
+            try:
+                if not node.remoter.sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
+                    self._install_perf(node)
+                self._perf_available = node.remoter.sudo("perf --version", ignore_status=True, timeout=30).ok
+            except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
+                self.log.warning("Could not install perf on %s: %s", node.name, exc)
+                self._perf_available = False
+            if not self._perf_available:
+                self.log.warning("perf does not run on %s; the run's profiles are skipped", node.name)
+        return self._perf_available
+
+    @staticmethod
+    def _install_perf(node) -> None:
+        """Install the running kernel's perf on an apt node, in bounded time.
+
+        Not 'install_package', which retries a failed install for minutes: this runs between two
+        query phases, and a package that is not there will not appear. A node without apt (the
+        containerized backends) is left as it is.
+        """
+        if not node.remoter.run("command -v apt-get", ignore_status=True, verbose=False, timeout=30).ok:
+            return
+        kernel = node.remoter.run("uname -r", verbose=False, timeout=30).stdout.strip()
+        node.remoter.sudo(
+            "apt-get -o Acquire::http::Timeout=60 -o Acquire::Retries=3 update", ignore_status=True, timeout=300
+        )
+        node.remoter.sudo(
+            "DEBIAN_FRONTEND=noninteractive apt-get install "
+            "-o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=60 -o Acquire::Retries=3 "
+            '-o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" '
+            f"-y linux-tools-{kernel} linux-tools-common",
+            ignore_status=True,
+            timeout=600,
+            retry=2,
+        )
+
+    def _start_profile(self, query: dict) -> str | None:
+        """Start sampling the scylla process in the background; the recording's name, or None."""
+        node = self.db_cluster.nodes[0]
+        if not self._perf_ready(node):
+            return None
+        self._profile_count = getattr(self, "_profile_count", 0) + 1
+        name = f"perf-{self._profile_count:02d}-{_checked_name(query['set'], 'query set name')}"
+        record = (
+            f"sleep {PROFILE_DELAY_SECS}; perf record -a -e cpu-clock -F {PROFILE_HZ} "
+            f"--call-graph dwarf,{PROFILE_STACK_BYTES} -o /tmp/{name}.data -- sleep {PROFILE_SECS}"
+        )
+        try:
+            node.remoter.sudo(
+                f"setsid sh -c '{record}' > /tmp/{name}.log 2>&1 < /dev/null &", verbose=False, timeout=30
+            )
+        except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
+            self.log.warning("Could not start profile %s: %s", name, exc)
+            return None
+        self.log.info("Profiling ScyllaDB for %s as %s", query, name)
+        return name
+
+    def _collect_profile(self, name: str) -> None:
+        """Wait for the recording to end, then gzip it and bring it to '<logdir>/perf/'."""
+        node = self.db_cluster.nodes[0]
+        dest = os.path.join(self.logdir, "perf")
+        # '[p]erf-...' so that the pattern does not match the waiting shell's own command line.
+        pattern = f"/tmp/[{name[0]}]{name[1:]}.data"
+        try:
+            node.remoter.run(
+                f"timeout {PROFILE_DELAY_SECS + PROFILE_SECS + 60} sh -c "
+                f"'while pgrep -f \"{pattern}\" > /dev/null; do sleep 2; done'",
+                ignore_status=True,
+                verbose=False,
+                timeout=PROFILE_DELAY_SECS + PROFILE_SECS + 90,
+            )
+            log = node.remoter.sudo(f"tail -3 /tmp/{name}.log", ignore_status=True, verbose=False).stdout.strip()
+            self.log.info("Profile %s: %s", name, log.replace("\n", " | "))
+            node.remoter.sudo(f"gzip -1 -f /tmp/{name}.data && chmod 644 /tmp/{name}.data.gz", timeout=300)
+            os.makedirs(dest, exist_ok=True)
+            node.remoter.receive_files(src=f"/tmp/{name}.data.gz", dst=dest, timeout=600)
+            node.remoter.sudo(f"rm -f /tmp/{name}.data.gz", ignore_status=True, verbose=False)
+        except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
+            self.log.warning("Could not collect profile %s: %s", name, exc)
 
     def _scrape_cpu(self) -> dict:
         """ScyllaDB's reactor busy total and the loader's and index node's /proc/stat, now.
