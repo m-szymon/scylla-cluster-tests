@@ -48,6 +48,7 @@ from search_perf_test import (
     SearchPerformanceTest,
     SearchWorkload,
     _checked_name,
+    _query_duration,
     _timeout_minutes,
 )
 from sdcm.utils.vector_store_index import index_build_columns
@@ -158,6 +159,48 @@ CPU_COLUMNS = [
         VS_CPU_COLUMN,
     )
 ]
+# A query phase with a writer ('write_rate' in the plan) adds rows while it runs; these say what
+# that cost the index it queried. 'ingested_rows' is how many changes the index took in through CDC
+# during the phase, 'index_lag_*' how long one took from its write in ScyllaDB to the commit that
+# made it searchable -- vector-store's 'indexing_lag_seconds' histogram of the fine CDC reader (the
+# wide one indexes every change again, minutes later), so the p99 is the bound of its bucket, and a
+# p99 past the last bucket (300 s) reads as INDEX_LAG_OVERFLOW_S.
+# 'write_op_rate' is what the writer achieved, 'segments' and 'l0_rows' the layout the phase
+# ended with (rows in wide segments when the last rewrite was planned), and
+# 'rewrite_ranges_done' the rewrite work done during the phase.
+INDEXING_LAG_METRIC = "indexing_lag_seconds"
+INDEXING_LAG_READER = "fine"
+INDEX_LAG_OVERFLOW_S = 600.0
+INGESTED_ROWS_COLUMN = "ingested_rows"
+WRITE_OP_RATE_COLUMN = "write_op_rate"
+INDEX_LAG_MEAN_COLUMN = "index_lag_mean_s"
+INDEX_LAG_P99_COLUMN = "index_lag_p99_s"
+SEGMENTS_COLUMN = "segments"
+L0_ROWS_COLUMN = "l0_rows"
+REWRITE_RANGES_COLUMN = "rewrite_ranges_done"
+INGEST_COLUMNS = [
+    ColumnMetadata(name=INGESTED_ROWS_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=WRITE_OP_RATE_COLUMN, unit="op/s", type=ResultType.INTEGER),
+    ColumnMetadata(name=INDEX_LAG_MEAN_COLUMN, unit="s", type=ResultType.FLOAT, higher_is_better=False),
+    ColumnMetadata(name=INDEX_LAG_P99_COLUMN, unit="s", type=ResultType.FLOAT, higher_is_better=False),
+    ColumnMetadata(name=SEGMENTS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=L0_ROWS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=REWRITE_RANGES_COLUMN, unit="", type=ResultType.INTEGER),
+]
+# The writer: 'write_rate' rows a second from one loader, for the phase's duration plus
+# WRITER_TAIL_SECS -- it starts with the query phase and has the same start-up to go through, so
+# the tail keeps it writing until the queries are done. It ends by itself rather than being killed:
+# a killed latte container is reported as a stress failure. Its rows take their names from the
+# first WRITER_NAMES_ROWS names of the dataset's first shard.
+WRITE_VALUES = ("sequential", "random")
+WRITER_TAIL_SECS = 30
+WRITER_CONCURRENCY = 64
+WRITER_NAMES_FILE = "writer_names.tsv"
+WRITER_NAMES_ROWS = 100_000
+# An index variant's 'order': what the index orders by, as substring.rn's named shapes -- absent,
+# the test case's 'order_by' column; 'table', no order_by (table order); 'unordered'; 'tie', the
+# 'tie_column' descending.
+VARIANT_ORDERS = ("table", "unordered", "tie")
 # How many of the index node's runtime threads were running, on average over a window of the
 # phase, sampled from /proc: tells a node whose workers are all busy from one waiting on something.
 VS_WORKERS_COLUMN = "vs_workers_running"
@@ -216,6 +259,34 @@ PROFILE_DELAY_SECS = 70
 PROFILE_SECS = 20
 PROFILE_HZ = 99
 PROFILE_STACK_BYTES = 8192
+# Run on each node as 'sh cpu_window.sh <delay secs> <window secs> <out>': the node's CPU reading
+# (the clock, /proc/stat's 'cpu' line, and ScyllaDB's reactor busy times where there is a ScyllaDB)
+# into '<out>.a' PROFILE_DELAY_SECS into the phase and into '<out>.b' at the end of the window or
+# when '<out>.stop' appears, whichever is first; '<out>.done' once it is over. So the CPU columns
+# cover the same window as the profiles and the thread states -- the queries' -- and not the
+# client's start-up, which diluted every CPU figure of run 0216688f by ~1.75x. A phase that ends
+# before the window has no '.a', and its columns fall back to the whole phase.
+CPU_WINDOW_SCRIPT = r"""snap() {
+    { date +%s.%N; head -1 /proc/stat; curl -s --max-time 5 http://localhost:9180/metrics 2>/dev/null \
+        | grep '^scylla_reactor_cpu_busy_ms'; } > "$1.tmp"
+    mv "$1.tmp" "$1"
+}
+i=0
+while [ "$i" -lt "$1" ] && [ ! -e "$3.stop" ]; do
+    sleep 1
+    i=$((i + 1))
+done
+if [ ! -e "$3.stop" ]; then
+    snap "$3.a"
+    i=0
+    while [ "$i" -lt "$2" ] && [ ! -e "$3.stop" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    snap "$3.b"
+fi
+touch "$3.done"
+"""
 # How many segments the layout log lists in full; the summary columns cover the rest.
 SEGMENT_LAYOUT_LOG_ROWS = 64
 _METRIC_LINE_RE_TEMPLATE = r"^{metric}\{{(?P<labels>[^}}]*)\}}\s+(?P<value>[0-9.eE+-]+)\s*$"
@@ -257,6 +328,13 @@ SERVED_INDEX_PROBE_DURATION = "5s"
 INDEX_COUNT_POLL_INTERVAL_SECS = 15.0
 SETTLE_POLL_INTERVAL_SECS = 10.0
 SETTLE_STABLE_POLLS = 3
+# Before each variant round, the indexes still standing must have stopped taking in changes: when
+# one index is dropped, vector-store may restart the CDC readers of the others (its session is
+# reset), and they read the last ten minutes of the log again -- in a local run, 212k changes,
+# minutes old, in the first phase of the next round. Quiet is CDC_QUIET_POLLS polls in a row on
+# SETTLE_POLL_INTERVAL_SECS with fewer than CDC_QUIET_CHANGES new changes each.
+CDC_QUIET_POLLS = 2
+CDC_QUIET_CHANGES = 100
 DEFAULT_SETTLE_TIMEOUT_SECS = 600
 
 
@@ -336,7 +414,9 @@ SUBSTRING_WORKLOAD = SearchWorkload(
 )
 
 
-def parse_index_gauge(metrics_text: str, metric: str, keyspace: str, index_name: str) -> float | None:
+def parse_index_gauge(
+    metrics_text: str, metric: str, keyspace: str, index_name: str, with_labels: dict | None = None
+) -> float | None:
     """Read one vector-store gauge for one index out of the Prometheus text exposition.
 
     Returns None when the index has no sample for the metric, which is what an older vector-store
@@ -350,9 +430,16 @@ def parse_index_gauge(metrics_text: str, metric: str, keyspace: str, index_name:
         if (
             labels.get("keyspace", "").lower() == wanted_keyspace
             and labels.get("index_name", "").lower() == wanted_index
+            and _has_labels(labels, with_labels)
         ):
             return float(match.group("value"))
     return None
+
+
+def _has_labels(labels: dict, wanted: dict | None) -> bool:
+    """Whether a sample carries each wanted label value -- or no such label at all, as a series of
+    an older vector-store that did not split it."""
+    return all(labels.get(name, value) == value for name, value in (wanted or {}).items())
 
 
 def checked_index_variants(dataset: dict) -> list[dict]:
@@ -371,9 +458,14 @@ def checked_index_variants(dataset: dict) -> list[dict]:
         ):
             raise ValueError(f"Index variant {label!r}: 'options' must map option names to string values")
         index_option_params(options)  # rejects what the script cannot carry
+        order = variant.get("order", "")
+        if order and order not in VARIANT_ORDERS:
+            raise ValueError(f"Index variant {label!r}: 'order' must be one of {VARIANT_ORDERS}, not {order!r}")
+        if order and "order_by" in options:
+            raise ValueError(f"Index variant {label!r}: 'order' and an 'order_by' option say the same thing twice")
         if any(label == seen["label"] for seen in checked):
             raise ValueError(f"Index variant label {label!r} is used twice")
-        checked.append({"label": label, "options": options})
+        checked.append({"label": label, "options": options, "order": order})
     return checked
 
 
@@ -401,7 +493,7 @@ def index_option_params(options: dict) -> str:
 
 
 def parse_index_gauge_series(
-    metrics_text: str, metric: str, keyspace: str, index_name: str, label: str
+    metrics_text: str, metric: str, keyspace: str, index_name: str, label: str, with_labels: dict | None = None
 ) -> dict[str, float]:
     """Every sample of one gauge for one index, keyed by the value of *label*.
 
@@ -418,6 +510,7 @@ def parse_index_gauge_series(
             labels.get("keyspace", "").lower() == wanted_keyspace
             and labels.get("index_name", "").lower() == wanted_index
             and label in labels
+            and _has_labels(labels, with_labels)
         ):
             series[labels[label]] = float(match.group("value"))
     return series
@@ -537,6 +630,116 @@ def parse_thread_states(text: str) -> dict[str, float]:
     return states
 
 
+def parse_cpu_snapshot(text: str) -> dict:
+    """One CPU_WINDOW_SCRIPT reading as {time, stat, reactor}, each part only when it is there."""
+    lines = text.splitlines()
+    snapshot = {}
+    if lines:
+        try:
+            snapshot["time"] = float(lines[0])
+        except ValueError:
+            return {}
+    if (stat := parse_proc_stat(text)) is not None:
+        snapshot["stat"] = stat
+    if (reactor := parse_reactor_busy(text)) is not None:
+        snapshot["reactor"] = reactor
+    return snapshot
+
+
+def parse_indexing_lag(metrics_text: str, keyspace: str, index_name: str) -> dict:
+    """The index's 'indexing_lag_seconds' histogram as {buckets: {le: count}, sum, count}, or {}.
+
+    The fine CDC reader's: the wide one indexes every change again, minutes later, which would
+    count each change twice and put its re-read's delay into the lag.
+    """
+    fine = {"reader": INDEXING_LAG_READER}
+    buckets = parse_index_gauge_series(metrics_text, f"{INDEXING_LAG_METRIC}_bucket", keyspace, index_name, "le", fine)
+    total = parse_index_gauge(metrics_text, f"{INDEXING_LAG_METRIC}_sum", keyspace, index_name, fine)
+    count = parse_index_gauge(metrics_text, f"{INDEXING_LAG_METRIC}_count", keyspace, index_name, fine)
+    if count is None or total is None:
+        return {}
+    return {"buckets": buckets, "sum": total, "count": count}
+
+
+def cdc_changes_total(metrics_text: str, keyspace: str, index_name: str) -> float | None:
+    """How many changes the index has taken in through CDC, by every reader, or None."""
+    counts = parse_index_gauge_series(metrics_text, f"{INDEXING_LAG_METRIC}_count", keyspace, index_name, "reader")
+    if counts:
+        return sum(counts.values())
+    return parse_index_gauge(metrics_text, f"{INDEXING_LAG_METRIC}_count", keyspace, index_name)
+
+
+def indexing_lag_cells(before: dict, after: dict) -> dict:
+    """The ingest cells for the changes indexed between two 'parse_indexing_lag' readings.
+
+    An index that took in nothing reports 0 rows and no lag: there was nothing to be late with.
+    A side missing (an index created in between, a failed scrape) leaves every cell empty.
+    """
+    if not before or not after:
+        return {}
+    count = after["count"] - before["count"]
+    if count <= 0:
+        return {INGESTED_ROWS_COLUMN: 0}
+    cells = {
+        INGESTED_ROWS_COLUMN: int(count),
+        INDEX_LAG_MEAN_COLUMN: round((after["sum"] - before["sum"]) / count, 3),
+    }
+    finite = sorted((float(le), value) for le, value in after["buckets"].items() if le != "+Inf")
+    p99 = INDEX_LAG_OVERFLOW_S
+    for le, value in finite:
+        if value - before["buckets"].get(_bucket_label(le, before["buckets"]), 0.0) >= 0.99 * count:
+            p99 = le
+            break
+    cells[INDEX_LAG_P99_COLUMN] = p99
+    return cells
+
+
+def _bucket_label(le: float, buckets: dict) -> str:
+    """The key of *buckets* whose bound is *le*: Prometheus writes '1' or '1.0' as it pleases."""
+    for label in buckets:
+        if label != "+Inf" and float(label) == le:
+            return label
+    return ""
+
+
+def duration_seconds(duration: str) -> int:
+    """A plan duration ('60s', '5m', '1h') in seconds."""
+    match = re.fullmatch(r"(\d+)([hms])", duration)
+    if not match:
+        raise ValueError(f"Not a duration: {duration!r}")
+    return int(match.group(1)) * {"h": 3600, "m": 60, "s": 1}[match.group(2)]
+
+
+def checked_writer(query: dict) -> tuple[int, str] | None:
+    """A query entry's writer as (rows a second, 'sequential' or 'random'), or None for no writer."""
+    if "write_rate" not in query:
+        if "write_values" in query:
+            raise ValueError(f"Query set {query.get('set')!r}: 'write_values' without 'write_rate'")
+        return None
+    rate = query["write_rate"]
+    if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0:
+        raise ValueError(f"Query set {query.get('set')!r}: 'write_rate' must be a positive number of rows a second")
+    values = query.get("write_values", "sequential")
+    if values not in WRITE_VALUES:
+        raise ValueError(
+            f"Query set {query.get('set')!r}: 'write_values' must be one of {WRITE_VALUES}, not {values!r}"
+        )
+    return rate, values
+
+
+def queries_for_variant(queries: list, label: str) -> list:
+    """The query entries a variant's round runs: the ones naming it in 'variants', or naming none."""
+    return [query for query in queries if "variants" not in query or label in query["variants"]]
+
+
+def variant_params(variant: dict) -> str:
+    """The '-P' flags that create an index variant: its options, and its order when it names one."""
+    params = index_option_params(variant["options"])
+    if variant.get("order"):
+        params += rf"-P index_order=\"{variant['order']}\" "
+    return params
+
+
 class SubstringSearchTest(SearchPerformanceTest):
     """Substring search (LIKE '%keyword%') performance test.
 
@@ -562,10 +765,14 @@ class SubstringSearchTest(SearchPerformanceTest):
             shape = f" ordered from {window:g}" if ordered else f" window from {window:g}"
         else:
             shape = " ordered" if ordered else ""
+        if query.get("order_column"):
+            shape += f" by {query['order_column']}"
         if direction == "asc" and (ordered or window > 0.0):
             shape += " asc"
         if match != "contains":
             shape = f" {match}{shape}"
+        if writer := checked_writer(query):
+            shape += f" +{writer[0]}/s {writer[1]} writes"
         # Which of the dataset's index variants answered; "" outside a variant round. Looked up
         # rather than read, since plan validation calls this on a stand-in for the test.
         variant = getattr(self, "_variant_label", "")
@@ -577,6 +784,8 @@ class SubstringSearchTest(SearchPerformanceTest):
             return ""
         direction = _checked_direction(query.get("order", "desc"))
         params = "-P search_ordered=true "
+        if query.get("order_column"):
+            params += r"-P search_order_column=\"tie\" "
         if direction != "desc":
             params += rf"-P search_direction=\"{direction}\" "
         return params
@@ -592,7 +801,26 @@ class SubstringSearchTest(SearchPerformanceTest):
         window = _checked_window(query.get("window", 0.0))
         direction = _checked_direction(query.get("order", "desc"))
         match = _checked_match(query.get("match", "contains"))
+        checked_writer(query)
         params = rf"-P search_match=\"{match}\" " if match != "contains" else ""
+        if query.get("check_order"):
+            # A plain query's order is defined only by an index in table order, so the plan says
+            # where to check it; an ordered one is always checked.
+            if not query.get("qrels"):
+                raise ValueError(f"Query set {query.get('set')!r}: 'check_order' needs 'qrels'")
+            params += "-P check_order=true "
+        order_column = query.get("order_column")
+        if order_column is not None:
+            if not self._tie_column or order_column != self._tie_column:
+                raise ValueError(
+                    f"Query set {query.get('set')!r} orders by {order_column!r}, but the table's tie column "
+                    f"('tie_column' in 'latte_schema_parameters') is {self._tie_column!r}"
+                )
+            if not ordered or window > 0.0:
+                raise ValueError(
+                    f"Query set {query.get('set')!r}: 'order_column' goes with 'ordered: true' and no window"
+                )
+            params += r"-P search_order_column=\"tie\" "
         if not ordered and window <= 0.0:
             return params
         if not self._order_by:
@@ -615,6 +843,26 @@ class SubstringSearchTest(SearchPerformanceTest):
     def _order_by(self) -> str:
         """The column the index orders by, from the test case, or "" when it has none."""
         return (self.params.get("latte_schema_parameters") or {}).get("order_by") or ""
+
+    @property
+    def _tie_column(self) -> str:
+        """The table's low-cardinality column, from the test case, or "" when it has none."""
+        return (self.params.get("latte_schema_parameters") or {}).get("tie_column") or ""
+
+    def validate_dataset(self, dataset: dict) -> None:
+        """Check what the shared validation cannot: each query's 'variants' against the dataset's."""
+        labels = [variant["label"] for variant in checked_index_variants(dataset)]
+        for step in dataset.get("steps", []):
+            for query in step.get("queries", []):
+                named = query.get("variants")
+                if named is None:
+                    continue
+                if not labels:
+                    raise ValueError(f"Query set {query.get('set')!r} names variants, but the dataset has none")
+                if not isinstance(named, list) or not named or not set(named) <= set(labels):
+                    raise ValueError(
+                        f"Query set {query.get('set')!r}: 'variants' must list some of {labels}, not {named!r}"
+                    )
 
     # Set per dataset from the plan's 'index_during_load'; see _run_dataset.
     _index_during_load = False
@@ -648,9 +896,23 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._variants = checked_index_variants(dataset)
         self._live_variants = {}
         self._variant_label = ""
+        self._write_next = 0  # the next sequential sort value a writer gives; the table starts empty
         if self._index_during_load:
             self.log.info("Dataset '%s': indexing during load; no build time will be measured", self._dataset_name)
         return super()._run_dataset(dataset)
+
+    def _load_shard(self, local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait):
+        """Load a shard, keeping the first one's first names for the writers of the query phases.
+
+        Taken here because a shard fetched from S3 is deleted once it is loaded.
+        """
+        writer_names = os.path.join(local_ds_dir, WRITER_NAMES_FILE)
+        if not os.path.isfile(writer_names):
+            with open(os.path.join(local_ds_dir, shard_file), encoding="utf-8") as source:
+                lines = [line for _, line in zip(range(WRITER_NAMES_ROWS), source)]
+            with open(writer_names, "w", encoding="utf-8") as names:
+                names.writelines(lines)
+        return super()._load_shard(local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait)
 
     def _load_step_shards(self, step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait):
         """Create the index before the step's rows are loaded, when indexing during load."""
@@ -665,7 +927,7 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self._live_variants = {}
                 for variant in self._variants:
                     name = f"{self._ingesting_index_name}_{variant['label']}"
-                    self._create_index_for_ingestion(name, index_option_params(variant["options"]))
+                    self._create_index_for_ingestion(name, variant_params(variant))
                     self._live_variants[name] = variant["label"]
             else:
                 self._create_index_for_ingestion(self._ingesting_index_name)
@@ -718,7 +980,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             for variant in self._variants:
                 name = f"{index_name}_{variant['label']}"
                 self._create_index_for_ingestion(
-                    name, index_option_params(variant["options"]), when="on the loaded table, to build by full scan"
+                    name, variant_params(variant), when="on the loaded table, to build by full scan"
                 )
                 self._live_variants[name] = variant["label"]
             self._load_finished_at = time.monotonic()
@@ -737,15 +999,52 @@ class SubstringSearchTest(SearchPerformanceTest):
         return build_seconds
 
     def _run_step_queries(self, step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir):
-        """Run the step's query sets once per index variant, or once as usual without variants."""
+        """Run the step's query sets once per index variant, or once as usual without variants.
+
+        Without 'variants' on any query, each round runs every query against whichever index
+        ScyllaDB picks, as before. With them, the rounds follow the plan's variant order: each runs
+        the queries naming its variant (or none), and its first query has to reach that variant --
+        an index serves only queries ordered its way, so a plan whose queries reach another index
+        than it names is a plan or a selection bug, reported rather than measured under the wrong
+        label.
+        """
+        # What a query phase's writer needs: where the step's files are, and what it has to write.
+        self._step_context = {
+            "defaults": defaults,
+            "record_count": record_count,
+            "local_ds_dir": local_ds_dir,
+            "remote_ds_dir": remote_ds_dir,
+        }
+        self._write_next = max(getattr(self, "_write_next", 0), record_count)
         if not self._live_variants:
             return super()._run_step_queries(
                 step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
             )
         keyspace = self._keyspace()
+        filtered = any("variants" in query for query in step.get("queries", []))
         while self._live_variants:
-            served = self._detect_served_index(keyspace, step, defaults, local_ds_dir, remote_ds_dir)
+            expected = None
+            round_step = step
+            if filtered:
+                live_labels = set(self._live_variants.values())
+                pending = [
+                    (variant["label"], queries_for_variant(step["queries"], variant["label"]))
+                    for variant in self._variants
+                    if variant["label"] in live_labels
+                ]
+                pending = [(label, queries) for label, queries in pending if queries]
+                if not pending:
+                    break  # the variants left have nothing to answer; the flow drops them
+                expected, queries = pending[0]
+                round_step = dict(step, queries=queries)
+            self._wait_for_cdc_quiet(keyspace, list(self._live_variants))
+            served = self._detect_served_index(keyspace, round_step, defaults, local_ds_dir, remote_ds_dir)
             self._variant_label = self._live_variants[served]
+            if expected is not None and self._variant_label != expected:
+                raise RuntimeError(
+                    f"The {round_step['queries'][0]['set']!r} probe reached variant {self._variant_label!r}, but "
+                    f"the plan runs those queries against {expected!r}: the query's shape picks another index"
+                )
             self._queried_index = (keyspace, served)
             self.log.info(
                 "Query round against index '%s' (variant '%s'); %d variant(s) to go after it",
@@ -755,7 +1054,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
             try:
                 super()._run_step_queries(
-                    step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
+                    round_step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
                 )
             finally:
                 self._variant_label = ""
@@ -823,46 +1122,222 @@ class SubstringSearchTest(SearchPerformanceTest):
         super()._drop_index(index_name, keyspace, max_index_wait)
 
     def search_extra_columns(self):
-        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS + VS_THREADS_COLUMNS
+        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS + VS_THREADS_COLUMNS + INGEST_COLUMNS
 
     def search_phase_begin(self, query: dict):
         # 'all_loaders: true' runs the phase from every loader at once: a second client, to tell a
         # limit of the client from one of the cluster.
         self._fan_out = bool(query.get("all_loaders", False))
+        ingest = self._scrape_ingest()
+        writer = self._start_writer(query)
         profiles = self._start_profiles(query) if query.get("profile") else []
         sampler = self._start_thread_sampler()
-        return self._scrape_walk_totals(), self._scrape_cpu(), profiles, sampler
+        cpu_window = self._start_cpu_window()
+        return {
+            "walk": self._scrape_walk_totals(),
+            "cpu": self._scrape_cpu(),
+            "profiles": profiles,
+            "sampler": sampler,
+            "cpu_window": cpu_window,
+            "writer": writer,
+            "ingest": ingest,
+        }
 
     def search_phase_end(self, phase) -> dict:
-        """What one query of the phase cost the index, and how busy each node was during it.
+        """What one query of the phase cost the index, how busy each node was, and what the writes did.
 
         The walk totals count every search the index served, so they also see whatever else queried
-        it meanwhile -- nothing does in this flow. The CPU covers the whole latte run, its start-up
-        included; the index node's thread states a window inside it. A scrape that failed on either
-        side leaves the cells empty rather than reporting a delta against nothing.
+        it meanwhile -- nothing does in this flow. The CPU covers the window the profiles and the
+        thread states do, PROFILE_DELAY_SECS in, when the phase lasts that long, and the whole latte
+        run otherwise. The writer is waited for after the windows are closed, so its tail is not in
+        them. A scrape that failed on either side leaves the cells empty rather than reporting a
+        delta against nothing.
         """
         self._fan_out = False
-        walk_before, cpu_before, profiles, sampler = phase
-        cpu = cpu_busy_pct(cpu_before, self._scrape_cpu())
+        walk_after = self._scrape_walk_totals()
+        cpu_after = self._scrape_cpu()
+        window = self._collect_cpu_window(phase["cpu_window"])
+        if window:
+            cpu = cpu_busy_pct(*window)
+            span = window[1]["time"] - window[0]["time"]
+            what = f"over {span:.0f} s from {PROFILE_DELAY_SECS} s into the phase"
+        else:
+            cpu = cpu_busy_pct(phase["cpu"], cpu_after)
+            what = "over the whole phase"
         if cpu:
-            self.log.info(
-                "CPU busy over the phase: %s", ", ".join(f"{column}={value}" for column, value in cpu.items())
-            )
-        cpu |= self._collect_thread_sampler(sampler)
-        for node, name in profiles:
+            self.log.info("CPU busy %s: %s", what, ", ".join(f"{column}={value}" for column, value in cpu.items()))
+        cpu |= self._collect_thread_sampler(phase["sampler"])
+        for node, name in phase["profiles"]:
             self._collect_profile(node, name)
-        after = self._scrape_walk_totals()
-        if walk_before is None or after is None:
-            return cpu
-        cells = walk_per_query(walk_before, after)
-        if cells:
+        cells = dict(cpu)
+        if phase["writer"] is not None:
+            cells |= self._finish_writer(phase["writer"])
+        ingest = self._ingest_cells(phase["ingest"], self._scrape_ingest())
+        if ingest:
+            self.log.info(
+                "Ingest over the phase: %s", ", ".join(f"{column}={value}" for column, value in ingest.items())
+            )
+        cells |= ingest
+        walk_before = phase["walk"]
+        if walk_before is None or walk_after is None:
+            return cells
+        walk = walk_per_query(walk_before, walk_after)
+        if walk:
             self.log.info(
                 "Index work per query: %s",
-                ", ".join(f"{column}={value}" for column, value in cells.items()),
+                ", ".join(f"{column}={value}" for column, value in walk.items()),
             )
         else:
             self.log.warning("The index served no searches during the phase; no per-query cost to report")
-        return cells | cpu
+        return walk | cells
+
+    def _start_writer(self, query: dict):
+        """Start the phase's writer, if the plan gives it one; its stress thread, or None."""
+        writer = checked_writer(query)
+        if writer is None:
+            return None
+        rate, values = writer
+        context = self._step_context
+        seconds = duration_seconds(_query_duration(query, context["defaults"])) + WRITER_TAIL_SECS
+        self._writer_count = getattr(self, "_writer_count", 0) + 1
+        prefix = f"w{self._writer_count:03d}_"
+        base = self._write_next
+        # Every sort value it may give, so the next writer's are all newer: rows it did not get to
+        # leave a gap, which an order does not mind.
+        self._write_next += rate * seconds
+        params = self.WORKLOAD.params
+        local_names = os.path.join(context["local_ds_dir"], WRITER_NAMES_FILE)
+        remote_names = os.path.join(context["remote_ds_dir"], WRITER_NAMES_FILE)
+        self.log.info(
+            "Writer '%s': %d rows a second, %s sort values from %d, for %d s", prefix, rate, values, base, seconds
+        )
+        return self.run_latte_thread(
+            stress_cmd=(
+                f"latte run -f write {self.WORKLOAD.script} "
+                f"--duration {seconds}s --rate={rate} --concurrency={WRITER_CONCURRENCY} "
+                rf"-P {params.dataset_dir}=\"{context['remote_ds_dir']}/\" "
+                rf"-P {params.records_file}=\"{WRITER_NAMES_FILE}\" "
+                rf"-P write_prefix=\"{prefix}\" -P write_base={base} "
+                rf"-P write_values=\"{values}\" -P write_sort_range={max(context['record_count'], 1)} "
+            ),
+            duration=_timeout_minutes(seconds + DEFAULT_SCHEMA_TIMEOUT),
+            extra_files_to_stage=[(local_names, remote_names)],
+            round_robin=True,
+        )
+
+    def _finish_writer(self, thread) -> dict:
+        """Wait for the writer to end by itself; the rate it achieved, as a cell."""
+        try:
+            results, errors = thread.parse_results()
+        except Exception as exc:  # noqa: BLE001 - the writer is load, not the measurement
+            self.log.warning("The phase's writer did not finish cleanly: %s", exc)
+            return {}
+        if errors:
+            self.log.warning("The phase's writer reported errors: %s", errors)
+        rates = [float(result.get("op rate") or 0) for result in results if isinstance(result, dict)]
+        if not rates:
+            return {}
+        self.log.info("The phase's writer wrote %.0f rows a second", sum(rates))
+        return {WRITE_OP_RATE_COLUMN: int(sum(rates))}
+
+    def _scrape_ingest(self) -> dict | None:
+        """The queried index's lag histogram, segment count, L0 rows and rewrite progress, or None."""
+        queried = getattr(self, "_queried_index", None)
+        if queried is None:
+            return None
+        keyspace, index_name = queried
+        try:
+            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
+        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
+            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+            return None
+        return {
+            "lag": parse_indexing_lag(metrics_text, keyspace, index_name),
+            "segments": parse_index_gauge(metrics_text, SEGMENT_COUNT_METRIC, keyspace, index_name),
+            "l0": parse_index_gauge(metrics_text, L0_DOCS_METRIC, keyspace, index_name),
+            "ranges_done": parse_index_gauge(metrics_text, REWRITE_RANGES_DONE_METRIC, keyspace, index_name),
+        }
+
+    @staticmethod
+    def _ingest_cells(before: dict | None, after: dict | None) -> dict:
+        """The INGEST_COLUMNS cells from two '_scrape_ingest' readings."""
+        if before is None or after is None:
+            return {}
+        cells = indexing_lag_cells(before["lag"], after["lag"])
+        if after["segments"] is not None:
+            cells[SEGMENTS_COLUMN] = int(after["segments"])
+        if after["l0"] is not None:
+            cells[L0_ROWS_COLUMN] = int(after["l0"])
+        if before["ranges_done"] is not None and after["ranges_done"] is not None:
+            cells[REWRITE_RANGES_COLUMN] = int(max(after["ranges_done"] - before["ranges_done"], 0))
+        return cells
+
+    def _cpu_window_nodes(self) -> list:
+        """(key, node) for each CPU the window reads, as '_scrape_cpu' keys them."""
+        return [
+            ("db", self.db_cluster.nodes[0]),
+            ("loader", self.loaders.nodes[0]),
+            ("vs", self._vector_store_node()),
+        ]
+
+    def _start_cpu_window(self) -> list:
+        """Start CPU_WINDOW_SCRIPT on each node; [(key, node, out)] for the ones it started on."""
+        self._cpu_window_count = getattr(self, "_cpu_window_count", 0) + 1
+        out = f"/tmp/cpu-window-{self._cpu_window_count:02d}"
+        installed = self.__dict__.setdefault("_cpu_window_installed", set())
+        script = base64.b64encode(CPU_WINDOW_SCRIPT.encode()).decode()
+        started = []
+        for key, node in self._cpu_window_nodes():
+            try:
+                if node.name not in installed:
+                    node.remoter.run(f"echo {script} | base64 -d > /tmp/cpu_window.sh", verbose=False, timeout=30)
+                    installed.add(node.name)
+                node.remoter.run(
+                    f"rm -f {out}.a {out}.b {out}.stop {out}.done; "
+                    f"setsid sh /tmp/cpu_window.sh {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
+                    f"> /dev/null 2>&1 < /dev/null &",
+                    verbose=False,
+                    timeout=30,
+                )
+                started.append((key, node, out))
+            except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
+                self.log.warning("Could not start the CPU window on %s: %s", node.name, exc)
+        return started
+
+    def _collect_cpu_window(self, started: list) -> tuple[dict, dict] | None:
+        """Close the windows; ('_scrape_cpu'-shaped reading at the start, at the end), or None.
+
+        None when the DB node's window never began -- the phase was shorter than the delay -- or
+        could not be read; the caller then reports the whole phase.
+        """
+        readings = ({}, {})
+        for key, node, out in started:
+            try:
+                text = node.remoter.run(
+                    f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out}.done ]; do sleep 1; done'; "
+                    f"cat {out}.a 2>/dev/null; echo '--- end of window ---'; cat {out}.b 2>/dev/null",
+                    ignore_status=True,
+                    verbose=False,
+                    timeout=60,
+                ).stdout
+            except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
+                self.log.warning("Could not read the CPU window on %s: %s", node.name, exc)
+                continue
+            first, _, second = text.partition("--- end of window ---")
+            for reading, part in zip(readings, (first, second)):
+                snapshot = parse_cpu_snapshot(part.strip())
+                if key == "db":
+                    if "time" in snapshot:
+                        reading["time"] = snapshot["time"]
+                    if "reactor" in snapshot:
+                        reading["db"] = snapshot["reactor"]
+                    if "stat" in snapshot:
+                        reading["db_host"] = snapshot["stat"]
+                elif "stat" in snapshot:
+                    reading[key] = snapshot["stat"]
+        if "time" not in readings[0] or "time" not in readings[1] or readings[1]["time"] <= readings[0]["time"]:
+            return None
+        return readings
 
     def _run_latte(self, stress_cmd, files_to_stage=None, **kwargs):
         """One loader per command, as the base runs it, except in an 'all_loaders' phase."""
@@ -1184,6 +1659,32 @@ class SubstringSearchTest(SearchPerformanceTest):
                     f"{self.WORKLOAD.item_noun} after {timeout}s of ingestion"
                 )
             time.sleep(INDEX_COUNT_POLL_INTERVAL_SECS)
+
+    def _wait_for_cdc_quiet(self, keyspace, index_names):
+        """Wait until the indexes stop taking in changes through CDC; see CDC_QUIET_POLLS."""
+        started = time.monotonic()
+        previous, quiet = None, 0
+        while time.monotonic() - started < self._max_settle:
+            try:
+                metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
+            except Exception as exc:  # noqa: BLE001 - one missed poll
+                self.log.warning("Could not scrape vector-store metrics: %s", exc)
+                time.sleep(SETTLE_POLL_INTERVAL_SECS)
+                continue
+            totals = {name: cdc_changes_total(metrics_text, keyspace, name) or 0.0 for name in index_names}
+            if previous is not None:
+                moved = sum(totals[name] - previous.get(name, 0.0) for name in totals)
+                quiet = quiet + 1 if moved < CDC_QUIET_CHANGES else 0
+                if quiet >= CDC_QUIET_POLLS:
+                    self.log.info("CDC quiet on %s after %.0f s", ", ".join(index_names), time.monotonic() - started)
+                    return
+                if moved >= CDC_QUIET_CHANGES:
+                    self.log.info("Indexes still taking in changes: %d in %.0f s", moved, SETTLE_POLL_INTERVAL_SECS)
+            previous = totals
+            time.sleep(SETTLE_POLL_INTERVAL_SECS)
+        self.log.warning(
+            "Indexes %s still taking in changes after %d s; the round starts anyway", index_names, self._max_settle
+        )
 
     def _wait_for_index_settled(self, keyspace, index_name, timeout):
         """Wait until the segment count stops moving, or give up and say so.

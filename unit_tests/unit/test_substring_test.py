@@ -371,13 +371,13 @@ def test_variants_are_validated_and_normalised():
         "index_variants": [{"label": "uncapped"}, {"label": "capped", "options": {"segment_rows": "100000"}}],
     }
     assert checked_index_variants(dataset) == [
-        {"label": "uncapped", "options": {}},
-        {"label": "capped", "options": {"segment_rows": "100000"}},
+        {"label": "uncapped", "options": {}, "order": ""},
+        {"label": "capped", "options": {"segment_rows": "100000"}, "order": ""},
     ]
     assert checked_index_variants({"name": "d"}) == []
     # Without 'index_during_load' the variants are built after the load, by a full scan each.
     assert checked_index_variants({"name": "d", "index_variants": [{"label": "wide"}]}) == [
-        {"label": "wide", "options": {}}
+        {"label": "wide", "options": {}, "order": ""}
     ]
 
 
@@ -459,8 +459,8 @@ def test_the_ordering_parameters_exist(script_source):
 
 def test_the_script_can_emit_an_order_by_clause(script_source):
     """Declaring the parameters is not enough; the query has to be built from them."""
-    assert "ORDER BY ${ORDER_BY} DESC" in script_source
-    assert "ORDER BY ${ORDER_BY} ASC" in script_source
+    assert "ORDER BY ${column} DESC" in script_source
+    assert "ORDER BY ${column} ASC" in script_source
     assert "'order_by': '${ORDER_BY}', " in script_source
 
 
@@ -657,3 +657,239 @@ def test_perf_is_not_installed_without_apt():
     node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=False))
     substring_test.SubstringSearchTest._install_perf(node)
     assert node.remoter.sudo_cmds == []
+
+
+# --- writers, lag and the CPU window ---------------------------------------------------------------
+
+LAG_METRICS = """\
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="0.05",reader="wide"} 7
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="0.05",reader="fine"} %d
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="0.5",reader="fine"} %d
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="5",reader="fine"} %d
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="300",reader="fine"} %d
+indexing_lag_seconds_bucket{index_name="ix",keyspace="ks",le="+Inf",reader="fine"} %d
+indexing_lag_seconds_sum{index_name="ix",keyspace="ks",reader="wide"} 9999.0
+indexing_lag_seconds_sum{index_name="ix",keyspace="ks",reader="fine"} %f
+indexing_lag_seconds_count{index_name="ix",keyspace="ks",reader="wide"} 999
+indexing_lag_seconds_count{index_name="ix",keyspace="ks",reader="fine"} %d
+indexing_lag_seconds_count{index_name="other",keyspace="ks",reader="fine"} 999
+"""
+
+
+def _lag(counts, total):
+    return substring_test.parse_indexing_lag(LAG_METRICS % (*counts, total, counts[-1]), "ks", "ix")
+
+
+def test_the_lag_of_a_phase_is_read_from_the_histogram_delta():
+    before = _lag((10, 10, 10, 10, 10), 0.1)
+    # 200 more changes: 100 under 50 ms, 98 more under 0.5 s, 2 more under 5 s.
+    after = _lag((110, 208, 210, 210, 210), 30.1)
+    assert substring_test.indexing_lag_cells(before, after) == {
+        substring_test.INGESTED_ROWS_COLUMN: 200,
+        substring_test.INDEX_LAG_MEAN_COLUMN: 0.15,
+        substring_test.INDEX_LAG_P99_COLUMN: 0.5,
+    }
+
+
+def test_a_lag_past_the_last_bucket_reads_as_the_overflow_value():
+    before = _lag((0, 0, 0, 0, 0), 0.0)
+    after = _lag((0, 0, 0, 50, 100), 50000.0)
+    cells = substring_test.indexing_lag_cells(before, after)
+    assert cells[substring_test.INDEX_LAG_P99_COLUMN] == substring_test.INDEX_LAG_OVERFLOW_S
+
+
+def test_the_lag_is_the_fine_readers_and_a_series_without_readers_still_reads():
+    """The wide reader indexes every change again minutes later; its series is not the lag."""
+    reading = _lag((1, 2, 3, 4, 5), 0.5)
+    assert reading["count"] == 5 and reading["sum"] == 0.5 and reading["buckets"]["0.05"] == 1
+    legacy = LAG_METRICS.replace(',reader="fine"', "") % (1, 2, 3, 4, 5, 0.5, 5)
+    legacy = "\n".join(line for line in legacy.splitlines() if 'reader="wide"' not in line)
+    assert substring_test.parse_indexing_lag(legacy, "ks", "ix")["count"] == 5
+
+
+def test_a_phase_without_writes_has_no_lag_and_a_missing_scrape_no_cells():
+    reading = _lag((10, 10, 10, 10, 10), 0.1)
+    assert substring_test.indexing_lag_cells(reading, reading) == {substring_test.INGESTED_ROWS_COLUMN: 0}
+    assert substring_test.indexing_lag_cells({}, reading) == {}
+    assert substring_test.parse_indexing_lag("", "ks", "ix") == {}
+
+
+def test_every_ingest_quantity_is_a_column():
+    names = {column.name for column in substring_test.INGEST_COLUMNS}
+    test = substring_test.SubstringSearchTest
+    before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "l0": 0.0, "ranges_done": 3.0}
+    after = {"lag": _lag((5, 5, 5, 5, 5), 0.1), "segments": 41.0, "l0": 1000.0, "ranges_done": 7.0}
+    cells = test._ingest_cells(before, after)
+    assert set(cells) | {substring_test.WRITE_OP_RATE_COLUMN} == names
+    assert cells[substring_test.REWRITE_RANGES_COLUMN] == 4
+
+
+def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():
+    text = (
+        "1793357687.25\n"
+        "cpu  100 0 50 800 50 0 10 5 0 0\n"
+        'scylla_reactor_cpu_busy_ms{shard="0"} 1000\n'
+        'scylla_reactor_cpu_busy_ms{shard="1"} 2000\n'
+    )
+    snapshot = substring_test.parse_cpu_snapshot(text)
+    assert snapshot["time"] == 1793357687.25
+    assert snapshot["stat"]["busy"] == 165.0
+    assert snapshot["reactor"] == {"0": 1000.0, "1": 2000.0}
+    assert substring_test.parse_cpu_snapshot("cpu  1 2 3 4\n") == {}
+    assert substring_test.parse_cpu_snapshot("") == {}
+
+
+def _run_cpu_window(tmp_path, delay: int, window: int, stop_after: float) -> tuple[str, str]:
+    script = tmp_path / "cpu_window.sh"
+    script.write_text(substring_test.CPU_WINDOW_SCRIPT)
+    out = tmp_path / "w"
+    window_proc = subprocess.Popen(["sh", str(script), str(delay), str(window), str(out)])
+    time.sleep(stop_after)
+    (tmp_path / "w.stop").touch()
+    window_proc.wait(timeout=10)
+    assert (tmp_path / "w.done").exists()
+    return tuple((tmp_path / f"w.{part}").read_text() if (tmp_path / f"w.{part}").exists() else "" for part in "ab")
+
+
+@pytest.mark.skipif(not os.path.isfile("/proc/stat"), reason="the window reads /proc/stat")
+def test_the_cpu_window_reads_the_window_and_skips_a_phase_that_ends_first(tmp_path):
+    first, second = _run_cpu_window(tmp_path, delay=0, window=600, stop_after=1.5)
+    start, end = substring_test.parse_cpu_snapshot(first), substring_test.parse_cpu_snapshot(second)
+    assert end["time"] > start["time"]
+    assert end["stat"]["total"] > start["stat"]["total"]
+    # A phase shorter than the delay: stopped before the window began, it read nothing, at once.
+    short = tmp_path / "short"
+    short.mkdir()
+    started = time.monotonic()
+    assert _run_cpu_window(short, delay=600, window=20, stop_after=0.5) == ("", "")
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ({"set": "s"}, None),
+        ({"set": "s", "write_rate": 2000}, (2000, "sequential")),
+        ({"set": "s", "write_rate": 5000, "write_values": "random"}, (5000, "random")),
+    ],
+)
+def test_a_writer_is_read_from_the_query_entry(query, expected):
+    assert substring_test.checked_writer(query) == expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"set": "s", "write_values": "random"},
+        {"set": "s", "write_rate": 0},
+        {"set": "s", "write_rate": "2k"},
+        {"set": "s", "write_rate": True},
+        {"set": "s", "write_rate": 10, "write_values": "shuffled"},
+    ],
+)
+def test_a_bad_writer_is_a_plan_error(query):
+    with pytest.raises(ValueError):
+        substring_test.checked_writer(query)
+
+
+def test_a_variant_round_runs_the_queries_that_name_it_or_none():
+    queries = [{"set": "a"}, {"set": "b", "variants": ["table"]}, {"set": "c", "variants": ["tier", "table"]}]
+    assert [q["set"] for q in substring_test.queries_for_variant(queries, "table")] == ["a", "b", "c"]
+    assert [q["set"] for q in substring_test.queries_for_variant(queries, "tier")] == ["a", "c"]
+    assert [q["set"] for q in substring_test.queries_for_variant(queries, "time")] == ["a"]
+
+
+def test_a_variant_can_say_what_its_index_orders_by():
+    dataset = {"name": "d", "index_variants": [{"label": "t", "order": "table"}, {"label": "time"}]}
+    variants = checked_index_variants(dataset)
+    assert substring_test.variant_params(variants[0]) == '-P index_order=\\"table\\" '
+    assert substring_test.variant_params(variants[1]) == ""
+    with pytest.raises(ValueError):
+        checked_index_variants({"name": "d", "index_variants": [{"label": "t", "order": "token"}]})
+    with pytest.raises(ValueError):
+        checked_index_variants(
+            {"name": "d", "index_variants": [{"label": "t", "order": "table", "options": {"order_by": "x"}}]}
+        )
+
+
+def test_the_variants_a_query_names_must_be_the_datasets():
+    test = object.__new__(substring_test.SubstringSearchTest)
+    dataset = {
+        "name": "d",
+        "index_variants": [{"label": "table", "order": "table"}, {"label": "tier", "order": "tie"}],
+        "steps": [{"queries": [{"set": "a", "variants": ["table"]}]}],
+    }
+    test.validate_dataset(dataset)
+    dataset["steps"][0]["queries"][0]["variants"] = ["time"]
+    with pytest.raises(ValueError):
+        test.validate_dataset(dataset)
+    with pytest.raises(ValueError):
+        test.validate_dataset({"name": "d", "steps": [{"queries": [{"set": "a", "variants": ["table"]}]}]})
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ({"set": "char2", "ordered": True, "order_column": "tier"}, " ordered by tier"),
+        ({"set": "char2", "write_rate": 2000}, " +2000/s sequential writes"),
+        (
+            {"set": "char2", "ordered": True, "write_rate": 5000, "write_values": "random"},
+            " ordered +5000/s random writes",
+        ),
+    ],
+)
+def test_the_order_column_and_the_writer_are_part_of_the_row_label(query, expected):
+    assert substring_test.SubstringSearchTest.query_shape_label(None, query) == expected
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        (
+            {"set": "char2", "ordered": True, "order_column": "tier"},
+            '-P search_order_column=\\"tie\\" -P search_ordered=true ',
+        ),
+        ({"set": "char2", "qrels": True, "check_order": True}, "-P check_order=true "),
+        ({"set": "char2", "write_rate": 2000}, ""),
+    ],
+)
+def test_the_order_column_and_the_order_check_become_script_parameters(query, expected):
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.params = {"latte_schema_parameters": {"order_by": "register_time", "tie_column": "tier"}}
+    assert test.extra_search_params(query, 3000) == expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"set": "char2", "ordered": True, "order_column": "rating"},
+        {"set": "char2", "order_column": "tier"},
+        {"set": "char2", "ordered": True, "window": 0.5, "order_column": "tier"},
+        {"set": "char2", "check_order": True},
+    ],
+)
+def test_an_order_column_or_order_check_the_table_cannot_honour_is_a_plan_error(query):
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.params = {"latte_schema_parameters": {"order_by": "register_time", "tie_column": "tier"}}
+    with pytest.raises(ValueError):
+        test.extra_search_params(query, 3000)
+
+
+def test_the_probe_orders_by_the_tie_column_when_the_queries_do():
+    query = {"set": "char2", "ordered": True, "order_column": "tier"}
+    assert substring_test.SubstringSearchTest._probe_shape(None, query) == (
+        '-P search_ordered=true -P search_order_column=\\"tie\\" '
+    )
+
+
+def test_a_tie_value_is_what_the_script_derives():
+    """derive_order_qrels.py's ground truth for the tie order assumes the script's tie_of()."""
+    with open(sct_abs_path(f"{substring_test.SUBSTRING_BASE_DIR}/substring.rn"), encoding="utf-8") as f:
+        source = f.read()
+    assert "((sort % 1000003) * 7919 + 13) % 1000003 % TIE_VALUES" in source
+
+
+def test_the_changes_an_index_took_in_count_every_reader():
+    text = LAG_METRICS % (1, 2, 3, 4, 5, 0.5, 5)
+    assert substring_test.cdc_changes_total(text, "ks", "ix") == 5 + 999
+    assert substring_test.cdc_changes_total(text, "ks", "nothing") is None

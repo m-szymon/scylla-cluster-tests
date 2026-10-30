@@ -31,6 +31,8 @@
 //!   latte run -f build_index substring.rn <node> -d 1
 //!   latte run -f search      substring.rn <node> -d 60s --concurrency 32 \
 //!       -P 'substring_data_dir="<dir>/"'
+//!   latte run -f write       substring.rn <node> -d 10m --rate 2000 \
+//!       -P 'names_file="writer_names.tsv"' -P 'write_prefix="w01_"' -P write_base=10000000
 //!
 //! Schema is idempotent (CREATE TABLE IF NOT EXISTS). Use schema_cleanup=true to drop the table, or
 //! drop_index=true to drop just the substring index.
@@ -69,6 +71,17 @@ const CASE_SENSITIVE = latte::param!("case_sensitive", true);
 //              Set it and the table gains a bigint column of that name, carrying the third field
 //              of the names file, and the index is created to order by it.
 const ORDER_BY = latte::param!("order_by", "");
+//   tie_column  an int column with only 'tie_values' distinct values, derived from the sort value
+//               by tie_of() -- a column like a rating or a status, whose many ties the index
+//               breaks in table order. Empty (the default) leaves it out of the table. Needs
+//               order_by, whose values it is derived from.
+const TIE_COLUMN = latte::param!("tie_column", "");
+const TIE_VALUES = latte::param!("tie_values", 5);
+//   index_order  what the index orders by, as a named shape, since an order_by list has spaces a
+//                -P value cannot carry: "" (the default) the order_by column, "table" no
+//                order_by option at all (table order), "unordered" 'order_by': 'unordered', "tie"
+//                the tie column descending.
+const INDEX_ORDER = latte::param!("index_order", "");
 //   extra_option_name / extra_option_value, extra_option2_name / ..., extra_option3_name / ...
 //              up to three more entries for the WITH OPTIONS map, for an option this script has no
 //              opinion about (segment_rows, rewrite, verify_candidates). Plain params rather
@@ -99,6 +112,20 @@ const SEARCH_MATCH = latte::param!("search_match", "contains");
 // The number of distinct sort values, needed to turn 'search_window_from' into a bound. The
 // generator numbers them 0..name_count-1, so this is the corpus size.
 const SORT_VALUE_COUNT = latte::param!("sort_value_count", 0);
+// "" (the default) orders by order_by, "tie" by the tie column.
+const SEARCH_ORDER_COLUMN = latte::param!("search_order_column", "");
+// Whether accuracy also checks the order of the answer. Always for an ordered search; for a plain
+// one, when the index keeps table order, which makes the plain answer's order defined too.
+const CHECK_ORDER = latte::param!("check_order", false);
+
+// Writer ('latte run -f write'): new rows while a query phase runs. Row i is '<write_prefix><i>',
+// named after the i-th name of the names file, with the sort value 'write_base + i' ("sequential":
+// every new row is the newest) or a pseudo-random one below 'write_sort_range' ("random": new rows
+// land anywhere in the order).
+const WRITE_PREFIX = latte::param!("write_prefix", "w_");
+const WRITE_BASE = latte::param!("write_base", 0);
+const WRITE_VALUES = latte::param!("write_values", "sequential");
+const WRITE_SORT_RANGE = latte::param!("write_sort_range", 0);
 
 // Dataset files
 const SUBSTRING_DATA_DIR = latte::param!("substring_data_dir", "./");
@@ -135,7 +162,13 @@ fn index_options_clause() {
     let opts = "";
     if MIN_GRAM > 0 && !is_extra_option("min_gram") { opts += `'min_gram': '${MIN_GRAM}', `; }
     if MAX_GRAM > 0 && !is_extra_option("max_gram") { opts += `'max_gram': '${MAX_GRAM}', `; }
-    if is_ordered() { opts += `'order_by': '${ORDER_BY}', `; }
+    if INDEX_ORDER == "" {
+        if is_ordered() && !is_extra_option("order_by") { opts += `'order_by': '${ORDER_BY}', `; }
+    } else if INDEX_ORDER == "unordered" {
+        opts += `'order_by': 'unordered', `;
+    } else if INDEX_ORDER == "tie" {
+        opts += `'order_by': '${TIE_COLUMN} DESC', `;
+    }
     if EXTRA_OPTION_NAME != "" { opts += `'${EXTRA_OPTION_NAME}': '${EXTRA_OPTION_VALUE}', `; }
     if EXTRA_OPTION2_NAME != "" { opts += `'${EXTRA_OPTION2_NAME}': '${EXTRA_OPTION2_VALUE}', `; }
     if EXTRA_OPTION3_NAME != "" { opts += `'${EXTRA_OPTION3_NAME}': '${EXTRA_OPTION3_VALUE}', `; }
@@ -153,18 +186,90 @@ fn is_ordered() {
     ORDER_BY != ""
 }
 
-/// The column list of the table, which gains the sort column only when there is one to gain.
+/// Whether the table has the tie column.
+fn has_tie() {
+    TIE_COLUMN != ""
+}
+
+/// The tie column's value for a row with sort value `sort`: one of 'tie_values', spread
+/// pseudo-randomly over the sort values. derive_order_qrels.py computes the same, so keep the two
+/// in step.
+fn tie_of(sort) {
+    ((sort % 1000003) * 7919 + 13) % 1000003 % TIE_VALUES
+}
+
+/// The column list of the table, which gains the sort and tie columns only when there are ones to gain.
 fn table_columns() {
-    if is_ordered() {
-        `user_id text PRIMARY KEY, ${TARGET_COLUMN} text, ${ORDER_BY} bigint`
-    } else {
-        `user_id text PRIMARY KEY, ${TARGET_COLUMN} text`
+    let columns = `user_id text PRIMARY KEY, ${TARGET_COLUMN} text`;
+    if is_ordered() { columns += `, ${ORDER_BY} bigint`; }
+    if has_tie() { columns += `, ${TIE_COLUMN} int`; }
+    columns
+}
+
+/// The INSERT every written row goes through, with the columns the table has.
+fn insert_statement() {
+    let columns = `user_id, ${TARGET_COLUMN}`;
+    let values = ":user_id, :name";
+    if is_ordered() { columns += `, ${ORDER_BY}`; values += ", :sort"; }
+    if has_tie() { columns += `, ${TIE_COLUMN}`; values += ", :tie"; }
+    `INSERT INTO ${KEYSPACE}.${TABLE} (${columns}) VALUES (${values})`
+}
+
+/// The bound values of insert_statement() for one row.
+fn insert_args(user_id, name, sort) {
+    let args = #{ "user_id": user_id, "name": name };
+    if is_ordered() { args.sort = sort; }
+    if has_tie() { args.tie = tie_of(sort); }
+    args
+}
+
+/// The shape parameters that do not depend on a phase, checked before anything is created.
+fn check_shape() {
+    if INDEX_ORDER != "" && INDEX_ORDER != "table" && INDEX_ORDER != "unordered" && INDEX_ORDER != "tie" {
+        return Err("index_order must be '', 'table', 'unordered' or 'tie'");
     }
+    if has_tie() && !is_ordered() {
+        return Err("tie_column is derived from the sort value, so it needs order_by");
+    }
+    if (INDEX_ORDER == "tie" || SEARCH_ORDER_COLUMN == "tie") && !has_tie() {
+        return Err("index_order=tie and search_order_column=tie need tie_column");
+    }
+    if SEARCH_ORDER_COLUMN != "" && SEARCH_ORDER_COLUMN != "tie" {
+        return Err("search_order_column must be '' or 'tie'");
+    }
+    Ok(())
+}
+
+/// Read the names file into db.data.names, as rows {id, name, sort}.
+async fn read_names(db) {
+    let path = join_path(SUBSTRING_DATA_DIR, NAMES_FILE);
+    let it = fs::read_split_lines_iter(path, ["\t"])?;
+    db.data.names = [];
+    while let Some(entry) = it.next() {
+        let raw = entry?;
+        if !raw.is_empty() {
+            // The third field is the ordered column's value. A corpus generated before that
+            // column existed has only two, so an ordered run against one has to fail here
+            // rather than insert nulls -- rows with no sort value are simply missing from an
+            // ordered answer, which looks like a recall bug in the index.
+            if is_ordered() {
+                if raw.len() < 3 {
+                    return Err(`names file ${path} has no sort value column, but order_by=${ORDER_BY} was set; regenerate the corpus with generate_local_dataset.py`);
+                }
+                db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": raw[2].parse::<i64>()? });
+            } else {
+                db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": 0 });
+            }
+        }
+    }
+    println!("Loaded {} names from {}", db.data.names.len(), path);
+    Ok(())
 }
 
 /// Create the pattern index if absent. Idempotent (IF NOT EXISTS), called from `schema`,
 /// `prepare` (load context), or `prepare` (build_index context).
 async fn create_index(db) {
+    check_shape()?;
     db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ${INDEX_NAME} ON ${KEYSPACE}.${TABLE}(${TARGET_COLUMN}) USING 'pattern_index'${index_options_clause()}`).await?;
     Ok(())
 }
@@ -227,6 +332,7 @@ pub async fn prepare(db) {
     let has_load = false;
     let has_build_index = false;
     let has_search = false;
+    let has_write = false;
 
     if !is_none(db.data.get("functions_to_invoke")) {
         for item in db.data.functions_to_invoke {
@@ -234,10 +340,12 @@ pub async fn prepare(db) {
             if name == "load" { has_load = true; }
             if name == "build_index" { has_build_index = true; }
             if name == "search" { has_search = true; }
+            if name == "write" { has_write = true; }
         }
     } else {
         has_load = true;
     }
+    check_shape()?;
 
     if has_load {
         db.execute(`CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH REPLICATION = \
@@ -246,34 +354,23 @@ pub async fn prepare(db) {
         if WITH_INDEX {
             create_index(db).await?;
         }
-
-        let path = join_path(SUBSTRING_DATA_DIR, NAMES_FILE);
-        let it = fs::read_split_lines_iter(path, ["\t"])?;
-        db.data.names = [];
-        while let Some(entry) = it.next() {
-            let raw = entry?;
-            if !raw.is_empty() {
-                // The third field is the ordered column's value. A corpus generated before that
-                // column existed has only two, so an ordered run against one has to fail here
-                // rather than insert nulls -- rows with no sort value are simply missing from an
-                // ordered answer, which looks like a recall bug in the index.
-                if is_ordered() {
-                    if raw.len() < 3 {
-                        return Err(`names file ${path} has no sort value column, but order_by=${ORDER_BY} was set; regenerate the corpus with generate_local_dataset.py`);
-                    }
-                    db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": raw[2].parse::<i64>()? });
-                } else {
-                    db.data.names.push(#{ "id": raw[0], "name": raw[1], "sort": 0 });
-                }
-            }
-        }
+        read_names(db).await?;
         db.load_cycle_count = db.data.names.len();
-        println!("Loaded {} names from {}", db.data.names.len(), path);
-        if is_ordered() {
-            db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (user_id, ${TARGET_COLUMN}, ${ORDER_BY}) VALUES (:user_id, :name, :sort)`).await?;
-        } else {
-            db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (user_id, ${TARGET_COLUMN}) VALUES (:user_id, :name)`).await?;
+        db.prepare(INSERT, insert_statement()).await?;
+    }
+
+    if has_write {
+        if WRITE_VALUES != "sequential" && WRITE_VALUES != "random" {
+            return Err("write_values must be 'sequential' or 'random'");
         }
+        if WRITE_VALUES == "random" && WRITE_SORT_RANGE <= 0 {
+            return Err("write_values=random needs write_sort_range, the range of sort values to write");
+        }
+        read_names(db).await?;
+        if db.data.names.len() == 0 {
+            return Err("the writer has no names to write");
+        }
+        db.prepare(INSERT, insert_statement()).await?;
     }
 
     if has_build_index {
@@ -329,7 +426,7 @@ pub async fn prepare(db) {
 
             db.declare_metric("recall", "higher");
             db.declare_metric("precision", "higher");
-            if SEARCH_ORDERED {
+            if SEARCH_ORDERED || CHECK_ORDER {
                 db.declare_metric("order", "higher");
             }
         }
@@ -341,6 +438,12 @@ pub async fn prepare(db) {
         // plausible number for the wrong thing.
         if (SEARCH_ORDERED || SEARCH_WINDOW_FROM > 0.0) && !is_ordered() {
             return Err("search_ordered/search_window_from need an index created with order_by");
+        }
+        if SEARCH_ORDER_COLUMN != "" && !SEARCH_ORDERED {
+            return Err("search_order_column needs search_ordered");
+        }
+        if SEARCH_ORDER_COLUMN != "" && SEARCH_WINDOW_FROM > 0.0 {
+            return Err("a window is a range on order_by, so it cannot go with search_order_column");
         }
         if SEARCH_WINDOW_FROM > 0.0 && SORT_VALUE_COUNT <= 0 {
             return Err("search_window_from needs sort_value_count, the number of distinct sort values");
@@ -372,10 +475,11 @@ pub async fn prepare(db) {
         }
         let order_clause = "";
         if SEARCH_ORDERED {
+            let column = if SEARCH_ORDER_COLUMN == "tie" { TIE_COLUMN } else { ORDER_BY };
             if ascending {
-                order_clause = ` ORDER BY ${ORDER_BY} ASC`;
+                order_clause = ` ORDER BY ${column} ASC`;
             } else {
-                order_clause = ` ORDER BY ${ORDER_BY} DESC`;
+                order_clause = ` ORDER BY ${column} DESC`;
             }
         }
         db.prepare(SEARCH, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern${window_clause}${order_clause} LIMIT ${SEARCH_LIMIT}`).await?;
@@ -386,6 +490,10 @@ pub async fn prepare(db) {
         db.set_report_field("search_ordered", `${SEARCH_ORDERED}`);
         db.set_report_field("search_window_from", `${SEARCH_WINDOW_FROM}`);
         db.set_report_field("search_direction", SEARCH_DIRECTION);
+        let order_column = if SEARCH_ORDER_COLUMN == "" { "-" } else { SEARCH_ORDER_COLUMN };
+        db.set_report_field("search_order_column", order_column);
+        let check_order = SEARCH_ORDERED || CHECK_ORDER;
+        db.set_report_field("check_order", `${check_order}`);
         db.set_report_field("search_match", SEARCH_MATCH);
 
         db.declare_metric("result_count", "higher");
@@ -399,11 +507,20 @@ pub async fn prepare(db) {
 
 pub async fn load(db, i) {
     let row = db.data.names[i % db.data.names.len()];
-    if is_ordered() {
-        db.execute_prepared(INSERT, #{ "user_id": row.id, "name": row.name, "sort": row.sort }).await?;
-    } else {
-        db.execute_prepared(INSERT, #{ "user_id": row.id, "name": row.name }).await?;
+    db.execute_prepared(INSERT, insert_args(row.id, row.name, row.sort)).await?;
+}
+
+/// One new row while a query phase runs: a new id, an existing name, and a sort value that is the
+/// newest one ("sequential") or anywhere in the range ("random").
+pub async fn write(db, i) {
+    let row = db.data.names[i % db.data.names.len()];
+    let sort = WRITE_BASE + i;
+    if WRITE_VALUES == "random" {
+        let h = latte::hash(WRITE_BASE + i);
+        if h < 0 { h = -h; }
+        sort = h % WRITE_SORT_RANGE;
     }
+    db.execute_prepared(INSERT, insert_args(`${WRITE_PREFIX}${i}`, row.name, sort)).await?;
 }
 
 pub async fn build_index(db, i) {
@@ -508,7 +625,7 @@ pub async fn search(db, i) {
                 // An ordered answer has exactly one right sequence when the ground truth lists the
                 // expected page in order, as derive_query_matrix.py writes it: 1.0 for that
                 // sequence, 0.0 for anything else, including the right rows out of order.
-                if SEARCH_ORDERED {
+                if SEARCH_ORDERED || CHECK_ORDER {
                     let same = returned_ids.len() == relevant_ids.len();
                     if same {
                         for k in 0..returned_ids.len() {
