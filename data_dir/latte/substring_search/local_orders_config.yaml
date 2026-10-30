@@ -1,0 +1,131 @@
+# Accuracy of the index orders other than the sort column's, and a smoke run of the writer, locally.
+#
+# local_matrix_config.yaml checks ORDER BY register_time DESC. This plan checks the rest of what a
+# pattern index can be asked, on the same 1M names capped at 20k rows a segment:
+#
+# - an index with no order_by answers a plain LIKE in table order (token, then key): '<set>_table',
+#   with the order checked ('check_order');
+# - an index with 'order_by': 'unordered' answers it with any matching rows: checked as a set, for
+#   the sets whose matches fit in a page;
+# - an index with 'order_by': 'tier DESC' -- five values, so most rows tie -- answers ORDER BY tier
+#   DESC with the ties in table order: '<set>_tier';
+# - the register_time index answers ORDER BY register_time ASC: '<set>_asc'.
+#
+# The ground truth comes from derive_order_qrels.py, run once on the derived corpus:
+#   python3 data_dir/latte/substring_search/derive_order_qrels.py --dataset names_1M_matrix
+#
+# Each query names the variant it is for ('variants'). The rounds go in the variants' order, and
+# each round's first query has to reach its variant: a plain LIKE goes to the table-order index
+# while it stands, and to the unordered one once it is dropped.
+#
+# The second dataset is the writer's smoke: a 200k-row table (names_200k_writes is a symlink to
+# names_1M_matrix, loading its first two shards), with phases that write 500 rows a second while
+# they query. Nothing in it is checked for accuracy -- the writes change every answer -- it shows
+# that the writer runs, and that the ingest columns (ingested_rows, index_lag_*, segments, l0_rows,
+# rewrite_ranges_done, write_op_rate) are filled.
+#
+#   ln -s names_1M_matrix data_dir/latte/substring_search/names_200k_writes
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/local_orders_config.yaml
+datasets:
+  - name: names_1M_matrix
+    index_during_load: true
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 3600
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {segment_rows: '20000'}
+      - label: unordered
+        order: unordered
+        options: {segment_rows: '20000'}
+      - label: tier
+        order: tie
+        options: {segment_rows: '20000'}
+      - label: time
+        options: {segment_rows: '20000'}
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 5s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char1_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char2_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char4_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char8_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char16_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char32_table, qrels: true, check_order: true, variants: [table]}
+          - {set: miss_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char1_rare_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char2_rare_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char4_rare_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char8_common_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char12_common_table, qrels: true, check_order: true, variants: [table]}
+          - {set: char8_table, qrels: true, variants: [unordered]}
+          - {set: char16_table, qrels: true, variants: [unordered]}
+          - {set: char32_table, qrels: true, variants: [unordered]}
+          - {set: miss_table, qrels: true, variants: [unordered]}
+          - {set: char1_rare_table, qrels: true, variants: [unordered]}
+          - {set: char2_rare_table, qrels: true, variants: [unordered]}
+          - {set: char4_rare_table, qrels: true, variants: [unordered]}
+          - {set: char12_common_table, qrels: true, variants: [unordered]}
+          - {set: char1_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char2_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char4_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char8_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char16_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char32_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: miss_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char1_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char2_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char4_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char8_common_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char12_common_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char1_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char2_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char4_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char8_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char16_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char32_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: miss_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char1_rare_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char2_rare_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char4_rare_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char8_common_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          - {set: char12_common_asc, ordered: true, order: asc, qrels: true, variants: [time]}
+          # The DESC control: what local_matrix_config.yaml checks, on this index.
+          - {set: char2, ordered: true, qrels: true, variants: [time]}
+          - {set: char8_common, ordered: true, qrels: true, variants: [time]}
+  - name: names_200k_writes
+    index_during_load: true
+    max_index_wait_secs: 1800
+    max_shard_load_secs: 1800
+    max_settle_secs: 600
+    index_variants:
+      - label: table
+        order: table
+        options: {segment_rows: '20000'}
+      - label: tier
+        order: tie
+        options: {segment_rows: '20000'}
+      - label: time
+        options: {segment_rows: '20000'}
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 20s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..1]
+        queries:
+          - {set: char2, variants: [table]}
+          - {set: char2, write_rate: 500, variants: [table]}
+          - {set: char2, ordered: true, order_column: tier, write_rate: 500, write_values: random, variants: [tier]}
+          - {set: char2, ordered: true, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 500, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 500, write_values: random, variants: [time]}

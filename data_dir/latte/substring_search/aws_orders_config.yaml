@@ -1,0 +1,120 @@
+# The index orders under load, and a steady stream of new rows, on AWS.
+#
+# Every AWS run so far queried one order -- register_time DESC, with the rows loaded in that order --
+# on an index that had settled, with nothing writing. Since then a pattern index answers in more
+# orders (scylladb 8f3590ce22, vector-store's table order):
+#
+# - no order_by: a plain LIKE in table order (token, then key), pageable. Every row lands at a
+#   random place in that order, whatever order the rows come in;
+# - 'order_by': 'unordered': a plain LIKE with any matching rows, the old behaviour;
+# - 'order_by': 'tier DESC': five values, so most rows tie; the ties come in table order, and the
+#   index's layout splits on (tier, token);
+# - 'order_by': 'register_time': ORDER BY register_time either way.
+#
+# This run asks, per order: what a query costs once the index has settled (char2 fills its page,
+# char8_common walks to fill it, miss walks everything), and what a steady writer does to it --
+# 2000 and 5000 rows a second, from a second latte on one loader, while the queries run. With
+# 'random' sort values the writes land anywhere in register_time's order, as table order's always
+# do. Every row reports, besides q/s and latency:
+# - ingested_rows, index_lag_mean_s, index_lag_p99_s: the changes the queried index took in during
+#   the phase, and how long one took from its write to being searchable;
+# - write_op_rate: what the writer achieved;
+# - segments, l0_rows, rewrite_ranges_done: the layout the phase ended with and the rewrite work
+#   done during it;
+# - the CPU columns, now over the same 20 s window as the thread states and profiles (70 s into the
+#   phase, inside latte's queries), not the whole phase with its start-up;
+# - walk costs per query, as before. Segments opened per query is what shows a tie-heavy order
+#   pruning or not.
+#
+# Two datasets, because the index node holds three indexes of 10M names (run 4c4b7647 thrashed
+# with six). Each round drops its index when it is done, so the writes pile up on fewer indexes
+# as the dataset goes on: round 1 ingests into three, round 3 into one. A round's rows are
+# comparable with each other; across rounds the table has grown by what the earlier rounds wrote
+# (about 1M rows a round), and the last phase of the register_time round, char2 with no writer
+# after its writes, shows how far a settled index's numbers moved.
+#
+#   A: names_10M_matrix, indexes table, tier, time; rounds in that order.
+#   B: names_10M_unordered (a symlink to names_10M_matrix, loaded again), indexes table and
+#      unordered: a plain LIKE goes to the table-order index while it stands, then to the unordered
+#      one -- the same queries against both, in one run.
+#
+# Profiles (DB node and index node, 20 s from 70 s in): char2 in table order, char8_common in tier
+# order, char2 with random writes in register_time order.
+#
+# Run with the case-sensitive overlay and the release package of scylladb 8f3590ce22 or later; the
+# vector-store node builds pattern-index-poc from GitHub:
+#   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config port_aws_chain.sh
+#
+# Budget: provisioning ~20 min; A: load and ingest of three indexes ~35 min, 21 phases at ~2.3 min
+# ~50 min, 3 profiles ~12 min; B: load and ingest of two ~30 min, 8 phases ~18 min; log collection
+# and teardown ~12 min: about 3:00.
+datasets:
+  - name: names_10M_matrix
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: tier
+        order: tie
+        options: {}
+      - label: time
+        options: {}
+    defaults:
+      limit: 20
+      duration: 60s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2, profile: true, variants: [table]}
+          - {set: char8_common, variants: [table]}
+          - {set: miss, variants: [table]}
+          - {set: char2, write_rate: 2000, variants: [table]}
+          - {set: char2, write_rate: 5000, variants: [table]}
+          - {set: char8_common, write_rate: 5000, variants: [table]}
+          - {set: char2, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char8_common, ordered: true, order_column: tier, profile: true, variants: [tier]}
+          - {set: miss, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char2, ordered: true, order_column: tier, write_rate: 5000, variants: [tier]}
+          - {set: char8_common, ordered: true, order_column: tier, write_rate: 5000, variants: [tier]}
+          - {set: char2, ordered: true, variants: [time]}
+          - {set: char8_common, ordered: true, variants: [time]}
+          - {set: miss, ordered: true, variants: [time]}
+          - {set: char2, ordered: true, order: asc, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 2000, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 5000, variants: [time]}
+          - {set: char8_common, ordered: true, write_rate: 5000, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 5000, write_values: random, profile: true, variants: [time]}
+          - {set: char8_common, ordered: true, write_rate: 5000, write_values: random, variants: [time]}
+          - {set: char2, ordered: true, variants: [time]}
+  - name: names_10M_unordered
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: unordered
+        order: unordered
+        options: {}
+    defaults:
+      limit: 20
+      duration: 60s
+      concurrency: 64
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2}
+          - {set: char8_common}
+          - {set: miss}
+          - {set: char2, write_rate: 5000}
