@@ -22,7 +22,10 @@ reads as "no measurement" rather than as an error.
 
 import dataclasses
 import logging
+import os
 import re
+import subprocess
+import time
 
 import pytest
 import requests
@@ -312,6 +315,38 @@ def test_cpu_is_priced_over_the_phase():
 def test_thread_states_are_read_from_the_sampler():
     text = "tokio-rt-worker R 3.61\ntokio-rt-worker S 1.39\nsome noise\n"
     assert parse_thread_states(text) == {"tokio-rt-worker R": 3.61, "tokio-rt-worker S": 1.39}
+
+
+def _run_sampler(tmp_path, delay: int, window: int, stop_after: float) -> str:
+    """The sampler's output for this test's own process, the stop file touched after 'stop_after'."""
+    script = tmp_path / "vs_threads.sh"
+    script.write_text(substring_test.VS_THREAD_SAMPLER)
+    out = tmp_path / "out"
+    with open(f"/proc/{os.getpid()}/comm") as comm:
+        name = comm.read().strip()
+    sampler = subprocess.Popen(["sh", str(script), name, str(delay), str(window), str(out)])
+    time.sleep(stop_after)
+    (tmp_path / "out.stop").touch()
+    sampler.wait(timeout=10)
+    return out.read_text()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="the sampler reads /proc")
+def test_the_thread_sampler_does_not_wait_out_its_delay_at_the_end_of_a_phase(tmp_path):
+    # A phase shorter than the delay: the end of the phase stops the sampler with nothing sampled.
+    started = time.monotonic()
+    text = _run_sampler(tmp_path, delay=600, window=20, stop_after=0.5)
+    assert time.monotonic() - started < 5
+    assert text.startswith("no samples")
+    assert parse_thread_states(text) == {}
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="the sampler reads /proc")
+def test_the_thread_sampler_reports_what_it_sampled_when_stopped_in_the_window(tmp_path):
+    started = time.monotonic()
+    text = _run_sampler(tmp_path, delay=0, window=600, stop_after=1.0)
+    assert time.monotonic() - started < 5
+    assert parse_thread_states(text)
 
 
 def test_every_cpu_quantity_is_a_column():

@@ -166,17 +166,23 @@ VS_THREADS_COLUMNS = [ColumnMetadata(name=VS_WORKERS_COLUMN, unit="", type=Resul
 # Run on the index node as 'sh vs_threads.sh <process name> <delay secs> <window secs> <out>': every
 # 10 ms of the window, the state of each of the process's threads, written to <out> once done as
 # '<name> <state> <average count>' lines, the names' trailing digits dropped (R running or
-# runnable, S sleeping, D in I/O). Plain sh with 'read' builtins and no pidof or pgrep, which a
+# runnable, S sleeping, D in I/O). The file '<out>.stop' ends it early, at the end of the phase:
+# over what it sampled until then, or with no samples if the window had not begun -- a short phase
+# does not wait out the delay. Plain sh with 'read' builtins and no pidof or pgrep, which a
 # container need not have.
 VS_THREAD_SAMPLER = r"""pid=
 for d in /proc/[0-9]*; do
     read -r comm < "$d/comm" 2>/dev/null && [ "$comm" = "$1" ] && pid=${d#/proc/} && break
 done
-sleep "$2"
+i=0
+while [ "$i" -lt "$2" ] && [ ! -e "$4.stop" ]; do
+    sleep 1
+    i=$((i + 1))
+done
 end=$(( $(date +%s) + $3 ))
 n=0
 tmp=$(mktemp)
-while [ -n "$pid" ] && [ "$(date +%s)" -lt "$end" ]; do
+while [ -n "$pid" ] && [ "$(date +%s)" -lt "$end" ] && [ ! -e "$4.stop" ]; do
     for f in /proc/"$pid"/task/*/stat; do
         read -r line < "$f" || continue
         rest=${line#*\(}
@@ -189,6 +195,8 @@ while [ -n "$pid" ] && [ "$(date +%s)" -lt "$end" ]; do
 done
 if [ -z "$pid" ]; then
     echo "no process named $1" > "$4.tmp"
+elif [ "$n" -eq 0 ]; then
+    echo "no samples: the phase ended before the window began" > "$4.tmp"
 else
     sed 's/[0-9-]*|/|/; s/ /_/g' "$tmp" | sort | uniq -c \
         | awk -v n="$n" '{split($2, a, "|"); printf "%s %s %.2f\n", a[1], a[2], $1 / n}' > "$4.tmp"
@@ -877,7 +885,7 @@ class SubstringSearchTest(SearchPerformanceTest):
                 node.remoter.run(f"echo {script} | base64 -d > /tmp/vs_threads.sh", verbose=False, timeout=30)
                 self._sampler_installed = True
             node.remoter.run(
-                f"rm -f {out}; setsid sh /tmp/vs_threads.sh vector-store {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
+                f"rm -f {out} {out}.stop; setsid sh /tmp/vs_threads.sh vector-store {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
                 f"> /dev/null 2>&1 < /dev/null &",
                 verbose=False,
                 timeout=30,
@@ -888,16 +896,16 @@ class SubstringSearchTest(SearchPerformanceTest):
         return out
 
     def _collect_thread_sampler(self, out: str | None) -> dict:
-        """The VS_THREADS_COLUMNS cell from the sampler's output, waiting for it if need be."""
+        """The VS_THREADS_COLUMNS cell from the sampler's output, stopping it at the end of the phase."""
         if out is None:
             return {}
         node = self._vector_store_node()
         try:
             node.remoter.run(
-                f"timeout {PROFILE_DELAY_SECS + PROFILE_SECS + 30} sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
+                f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
                 ignore_status=True,
                 verbose=False,
-                timeout=PROFILE_DELAY_SECS + PROFILE_SECS + 60,
+                timeout=60,
             )
             text = node.remoter.run(f"cat {out}", ignore_status=True, verbose=False, timeout=30).stdout
         except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
@@ -905,7 +913,9 @@ class SubstringSearchTest(SearchPerformanceTest):
             return {}
         states = parse_thread_states(text)
         if not states:
-            self.log.warning("The index node's thread sampler said: %s", text.strip()[:300])
+            # No samples is what a phase shorter than PROFILE_DELAY_SECS gets, not a failure.
+            log = self.log.info if text.startswith("no samples") else self.log.warning
+            log("The index node's thread sampler said: %s", text.strip()[:300])
             return {}
         self.log.info(
             "Index node threads (average count by name and state): %s",
