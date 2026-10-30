@@ -206,3 +206,7 @@ latte_schema_parameters:
   # is what lets a plan ask a query set with 'ordered' or 'window'. Remove it to run the stage-1
   # shape, in which case no query entry may ask for either.
   order_by: 'register_time'
+  # A low-cardinality int column, five values derived from register_time (substring.rn's tie_of):
+  # what an index variant with 'order: tie' orders by, and a query set with 'order_column: tier'
+  # asks by -- a column like a rating, whose many ties the index breaks in table order.
+  tie_column: 'tier'

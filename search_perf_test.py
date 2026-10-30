@@ -841,6 +841,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         # The workload's own query keys, checked here for the same reason the shared ones are: a
         # typo should cost a second, not the half hour it takes to load and index a corpus.
         for dataset in datasets:
+            self.validate_dataset(dataset)
             for step in dataset.get("steps", []):
                 for query in step.get("queries", []):
                     self.extra_search_params(query, 0)
@@ -948,6 +949,12 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         is a cell left empty, which is how a measurement that could not be taken should look.
         """
         return {}
+
+    def validate_dataset(self, dataset: dict) -> None:
+        """Reject a dataset entry the workload cannot run, before anything is loaded.
+
+        For checks that need the whole dataset rather than one query entry; the base flow has none.
+        """
 
     def extra_search_params(self, query: dict, record_count: int) -> str:
         """Workload-specific '-P name=value ' flags for a query entry, or "".

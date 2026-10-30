@@ -166,6 +166,59 @@ there is a cap), and `verify_candidates: 'scylla'` moves the check of a long key
 to ScyllaDB. The plans of the September runs used the placeholders `poc_option_2` and
 `poc_option_3` for the first two; they have been translated.
 
+### Index orders, and a writer during a phase
+
+A pattern index answers in the order its `order_by` option names, and ScyllaDB serves each query
+from the index whose order fits it. A plain LIKE goes to an index without `order_by` (table order),
+or failing that to one with `'order_by': 'unordered'`. An ORDER BY goes to an index ordered that
+way. A variant names its order with `order`, one of `substring.rn`'s named shapes, since an order
+list has spaces a latte parameter cannot carry:
+
+- absent: the test case's `order_by` column, as before;
+- `table`: no `order_by` option, so table order;
+- `unordered`: `'order_by': 'unordered'`;
+- `tie`: the test case's `tie_column` descending. That column is an int with five values derived
+  from the sort value (`tie_of()` in `substring.rn`), like a rating, so most rows tie.
+
+A query entry asks in a variant's shape:
+
+- `ordered: true, order_column: tier` orders by the tie column;
+- `check_order: true`, with `qrels`, checks the order of a plain LIKE's answer, which is defined
+  only by a table-order index;
+- `variants: [label, ...]` says which variants' rounds run the entry. Absent, every round runs it.
+
+Every round waits first until the indexes still standing stop taking in changes. Dropping one
+index can restart the others' CDC readers, which then read the last ten minutes of the log again;
+in a local run, the first phase after a drop counted 212k changes that were minutes old.
+
+When a step's queries name variants, the rounds go in the variants' order. Each round runs the
+entries naming its variant, and its probe has to reach that variant. A plan whose queries reach
+another index fails there, rather than reporting rows under the wrong label.
+
+`write_rate: N` (rows a second) adds a writer to the phase: a second latte on one loader, inserting
+new rows while the queries run, for the phase's duration plus 30 s. It ends by itself, since a
+killed latte container counts as a stress failure. Its rows take their names from the first 100k of
+the dataset's first shard. Their sort values come after every existing one
+(`write_values: sequential`, the default) or anywhere in the range (`random`). The phase's row then
+carries:
+
+- `ingested_rows`, `index_lag_mean_s` and `index_lag_p99_s`: changes the queried index took in and
+  how long each took from its write to being searchable. These come from vector-store's
+  `indexing_lag_seconds` histogram, the fine CDC reader's series (the wide reader indexes every
+  change again, minutes later). So the p99 is a bucket bound, and past the last bucket it reads
+  600;
+- `write_op_rate`: what the writer achieved;
+- `segments`, `l0_rows` and `rewrite_ranges_done`: the layout at the end of the phase, and the
+  rewrite work done during it.
+
+The CPU columns, the thread states and the profiles all cover one window: 20 s from 70 s into the
+phase, inside latte's queries. Each node records its own CPU reading at both ends of the window. A
+phase that ends before the window reports CPU over the whole phase instead, as all phases did
+before.
+
+`local_orders_config.yaml` checks the orders' accuracy locally against the ground truth of
+`derive_order_qrels.py`, and smoke-runs the writer. `aws_orders_config.yaml` measures them on AWS.
+
 The corpus now carries a third column (`user_id<TAB>nickname<TAB>register_time`), so a corpus
 generated before this existed has to be regenerated before an ordered run. The rune script says so
 rather than inserting nulls, which would look like a recall bug in the index.
@@ -471,8 +524,8 @@ SSH, not into indexing. The two-hour ingestion budget in the plan is deliberatel
   cover is the paging state itself: the cursor's round trip through `paging_state`, and whether the
   pages of one query are disjoint and cover everything. That is checked in the ScyllaDB tree
   instead.
-* **Mixed workloads.** Names are loaded, then queried. Nothing updates a name while the queries run,
-  so the index's write path is measured only as build throughput.
+* **Updates and deletes.** A phase can insert new rows while it queries (`write_rate`), but nothing
+  updates or deletes an existing row, so the cost of a moved sort value is not measured.
 * **More than one index.** Real use indexes both a nickname and a username column and merges the two
   answers in the application. The plan builds one index at a time.
 * **Failure modes.** No nemesis, no node loss, no vector-store restart.

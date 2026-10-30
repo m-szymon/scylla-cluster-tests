@@ -694,6 +694,8 @@ class _PlanTester:
     def _run_dataset(self, dataset):
         self.ran.append(dataset["name"])
 
+    validate_dataset = search_perf_test.SearchPerformanceTest.validate_dataset
+
 
 def _run_plan(tmp_path, plan):
     plan_path = tmp_path / "plan.yaml"
