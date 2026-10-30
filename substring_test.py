@@ -198,12 +198,13 @@ mv "$4.tmp" "$4"
 """
 # A query entry with 'profile: true' samples the DB node's CPUs during the phase: a system-wide
 # 'perf record' (as scylla-perf-collector does; 'perf report --comm scylla' narrows it), from
-# PROFILE_DELAY_SECS into the phase (past the client's start-up) for PROFILE_SECS, PROFILE_HZ
+# PROFILE_DELAY_SECS into the phase (past the client's start-up: latte's queries began 33-66 s
+# after the phase did in run 0216688f, whose 10 s delay profiled idle nodes) for PROFILE_SECS, PROFILE_HZ
 # samples a second per CPU of the cpu-clock timer -- an EC2 VM exposes no hardware cycle counter --
 # with DWARF call stacks, since a release build keeps no frame pointers. The recording is gzipped
 # and collected to '<logdir>/perf/'; the node's binary is stripped, so it is read against the
 # unstripped build with the same build id.
-PROFILE_DELAY_SECS = 10
+PROFILE_DELAY_SECS = 70
 PROFILE_SECS = 20
 PROFILE_HZ = 99
 PROFILE_STACK_BYTES = 8192
@@ -562,6 +563,16 @@ class SubstringSearchTest(SearchPerformanceTest):
         variant = getattr(self, "_variant_label", "")
         return f"{shape} [{variant}]" if variant else shape
 
+    def _probe_shape(self, query: dict) -> str:
+        """The ORDER BY of `query` and nothing else: what decides which index serves it."""
+        if not (query.get("ordered") or _checked_window(query.get("window", 0.0)) > 0.0):
+            return ""
+        direction = _checked_direction(query.get("order", "desc"))
+        params = "-P search_ordered=true "
+        if direction != "desc":
+            params += rf"-P search_direction=\"{direction}\" "
+        return params
+
     def extra_search_params(self, query: dict, record_count: int) -> str:
         """Translate the plan's 'ordered' and 'window' keys into substring.rn's '-P' flags.
 
@@ -583,7 +594,9 @@ class SubstringSearchTest(SearchPerformanceTest):
                 f"Query set {query.get('set')!r} asks for an ordered or windowed search, but "
                 f"'latte_schema_parameters' sets no 'order_by', so the index has nothing to order by"
             )
-        params += f"-P search_ordered={'true' if ordered else 'false'} "
+        # A windowed search is ordered too: a range on the ordering column comes with its ORDER BY,
+        # since an index with order_by serves only queries ordered by its columns.
+        params += "-P search_ordered=true "
         if direction != "desc":
             params += rf"-P search_direction=\"{direction}\" "
         if window > 0.0:
@@ -749,10 +762,12 @@ class SubstringSearchTest(SearchPerformanceTest):
     def _detect_served_index(self, keyspace, step, defaults, local_ds_dir, remote_ds_dir) -> str:
         """Which of the live variant indexes ScyllaDB routes the step's queries to.
 
-        A few seconds of the first query set, plain, bracketed by two scrapes of every candidate's
-        search total: the one that moved is the one serving. The choice is ScyllaDB's and stable
-        for as long as the set of indexes does not change, which is why a round ends by dropping
-        the index it measured.
+        A few seconds of the first query set, in its own shape, bracketed by two scrapes of every
+        candidate's search total: the one that moved is the one serving. The shape matters: a query
+        with ORDER BY goes to an index ordered that way, one without to an index in table order, so
+        a plain probe could find another index than the step's queries use, or none. The choice is
+        ScyllaDB's and stable for as long as the set of indexes does not change, which is why a
+        round ends by dropping the index it measured.
         """
         params = self.WORKLOAD.params
         qset = _checked_name(step["queries"][0]["set"], "query set name")
@@ -764,6 +779,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             rf"-P {params.queries_file}=\"{queries_file}\" "
             f"-P {params.compute_accuracy}=false "
             f"-P {params.search_limit}={defaults.get('limit', 20)} "
+            f"{self._probe_shape(step['queries'][0])}"
             f"--concurrency=4 --retry-number 1 ",
             files_to_stage=[(os.path.join(local_ds_dir, queries_file), os.path.join(remote_ds_dir, queries_file))],
         )
@@ -939,6 +955,15 @@ class SubstringSearchTest(SearchPerformanceTest):
             timeout=600,
             retry=2,
         )
+        # An HWE kernel's tools next to an older 'linux-tools-common', whose 'perf' wrapper then
+        # looks under the wrong version ("perf not found for kernel"): the installed binary itself.
+        if not node.remoter.sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
+            node.remoter.sudo(
+                f"sh -c 'for p in /usr/lib/linux-tools/{kernel}/perf /usr/lib/linux-*-tools-*/perf; do "
+                '[ -x "$p" ] && ln -sf "$p" /usr/local/bin/perf && break; done\'',
+                ignore_status=True,
+                timeout=30,
+            )
 
     def _start_profiles(self, query: dict) -> list:
         """Start sampling the DB node and the index node; the (node, recording) pairs started."""
