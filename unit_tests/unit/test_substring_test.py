@@ -497,6 +497,8 @@ def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
             {"set": "char2", "match": "suffix", "ordered": True, "window": 0.5},
             '-P search_match=\\"suffix\\" -P search_ordered=true -P search_window_from=0.5 -P sort_value_count=3000 ',
         ),
+        # A window comes with its ORDER BY: an ordered index serves no other query.
+        ({"set": "char2", "window": 0.5}, "-P search_ordered=true -P search_window_from=0.5 -P sort_value_count=3000 "),
     ],
 )
 def test_the_direction_and_the_match_become_script_parameters(query, expected):
@@ -505,6 +507,21 @@ def test_the_direction_and_the_match_become_script_parameters(query, expected):
     test = object.__new__(substring_test.SubstringSearchTest)
     test.params = {"latte_schema_parameters": {"order_by": "register_time"}}
     assert test.extra_search_params(query, 3000) == expected
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ({"set": "char2"}, ""),
+        ({"set": "char2", "match": "prefix"}, ""),
+        ({"set": "char2", "ordered": True}, "-P search_ordered=true "),
+        ({"set": "char2", "window": 0.5, "order": "asc"}, '-P search_ordered=true -P search_direction=\\"asc\\" '),
+    ],
+)
+def test_the_served_index_probe_asks_in_the_queries_shape(query, expected):
+    """The probe that finds the serving index orders as the step's queries do and nothing more:
+    the ORDER BY is what picks among the pattern indexes on a column."""
+    assert substring_test.SubstringSearchTest._probe_shape(None, query) == expected
 
 
 @pytest.mark.parametrize("query", [{"set": "char2", "order": "up"}, {"set": "char2", "match": "infix"}])
@@ -565,8 +582,9 @@ def test_an_index_that_never_answers_still_times_out(monkeypatch):
 
 
 class _FakeRemoter:
-    def __init__(self, has_apt):
+    def __init__(self, has_apt, perf_runs=True):
         self.has_apt = has_apt
+        self.perf_runs = perf_runs
         self.sudo_cmds = []
 
     def run(self, cmd, **_):
@@ -575,7 +593,10 @@ class _FakeRemoter:
         return dataclasses.make_dataclass("R", [("stdout", str)])("6.8.0-1017-aws\n")
 
     def sudo(self, cmd, **kwargs):
+        if cmd == "perf --version":
+            return dataclasses.make_dataclass("R", [("ok", bool)])(self.perf_runs)
         self.sudo_cmds.append((cmd, kwargs))
+        return dataclasses.make_dataclass("R", [("ok", bool)])(True)
 
 
 def test_perf_is_installed_with_bounded_apt_calls():
@@ -587,6 +608,14 @@ def test_perf_is_installed_with_bounded_apt_calls():
     assert "DPkg::Lock::Timeout=120" in install[0]
     assert install[0].endswith("-y linux-tools-6.8.0-1017-aws linux-tools-common")
     assert install[1]["timeout"] and install[1]["ignore_status"]
+
+
+def test_perf_binary_is_linked_when_the_wrapper_misses_the_kernel():
+    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=True, perf_runs=False))
+    substring_test.SubstringSearchTest._install_perf(node)
+    _, _, link = node.remoter.sudo_cmds
+    assert "/usr/lib/linux-tools/6.8.0-1017-aws/perf" in link[0]
+    assert "ln -sf" in link[0] and "/usr/local/bin/perf" in link[0]
 
 
 def test_perf_is_not_installed_without_apt():
