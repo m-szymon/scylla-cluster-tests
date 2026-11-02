@@ -209,12 +209,24 @@ carries:
   600;
 - `write_op_rate`: what the writer achieved;
 - `segments`, `l0_rows` and `rewrite_ranges_done`: the layout at the end of the phase, and the
-  rewrite work done during it.
+  rewrite work done during it. `l0_rows` is the rows in wide segments when the last rewrite was
+  planned, not a live count;
+- `merges_started` and `merges_ended`: the merges the index's ticks asked for and saw end during
+  the phase (vector-store's `pattern_merges_*` gauges; Tantivy's own merges after a commit are not
+  counted). `started` far ahead of `ended` is a backlog. Run a0e51aa9 (2026-11-02) had one of
+  thousands, the same merge queued again every second while it ran, before vector-store's
+  `bdce43f`.
 
-The CPU columns, the thread states and the profiles all cover one window: 20 s from 70 s into the
-phase, inside latte's queries. Each node records its own CPU reading at both ends of the window. A
-phase that ends before the window reports CPU over the whole phase instead, as all phases did
-before.
+The CPU columns and the thread states cover one window: 20 s from 70 s into the phase, inside
+latte's queries. Each node records its own CPU reading at both ends of the window. A phase that
+ends before the window reports CPU over the whole phase instead, as all phases did before. A
+profile does not trust the fixed delay: run a0e51aa9's first one, 70 s in, recorded an idle DB
+node while the CPU window read it 83% busy. It waits 20 s, then until the node's CPUs are 25% busy
+(120 s at most), then 10 s more, and its log line in `sct.log` says how long it waited.
+
+An index counts as settled once its segment count has held for three polls with no rewrite and no
+merge running (`pattern_merges_running`). A held count alone is not enough: run a0e51aa9's index
+held 712 segments for three polls with thousands of merges queued.
 
 `local_orders_config.yaml` checks the orders' accuracy locally against the ground truth of
 `derive_order_qrels.py`, and smoke-runs the writer. `aws_orders_config.yaml` measures them on AWS.
@@ -515,7 +527,13 @@ What follows for the instance types:
   An index node out of memory does not crash; it stops answering. The test gives up once the node
   has answered no scrape or status poll for 3 minutes (`VS_UNRESPONSIVE_ABORT_SECS`), and logs the
   node's available memory and the vector-store RSS once a minute to its journal (`vs-memory` in
-  `hosts/<vs node>/messages.log`), which the runner keeps as it is written.
+  `hosts/<vs node>/messages.log`), which the runner keeps as it is written. The diagnostics'
+  SSH calls (CPU readings, the thread sampler, profiles) each give up 30 s past their own timeout,
+  and the index node's are not tried while it answers no HTTP request: an SSH call to a node out of
+  memory can wait for good, and run a0e51aa9's did.
+  These memory figures were measured before vector-store's `bdce43f`, which stopped merges being
+  queued again while they ran; the queued ones held their segments in memory, so the peaks may
+  read lower now.
 
 `instance_type_db`
 : not idle. Every containment query returns up to `limit` primary keys and Scylla then reads those

@@ -35,6 +35,7 @@ JSONL into the run's logdir rather than posted -- which is how this test is norm
 import base64
 import os
 import re
+import threading
 import time
 
 import requests
@@ -107,6 +108,12 @@ REWRITE_RANGES_TOTAL_METRIC = "pattern_rewrite_ranges_total"
 REWRITE_RANGES_DONE_METRIC = "pattern_rewrite_ranges_done"
 REWRITE_DOCS_METRIC = "pattern_rewrite_docs_total"
 L0_DOCS_METRIC = "pattern_l0_docs"
+# The merges an index's own ticks ask for (Tantivy's merges after a commit are not counted):
+# running totals of started and ended, and how many run now. An index is not settled while one
+# runs; 'started' far ahead of 'ended' is a merge queued again while it still ran (run a0e51aa9).
+MERGES_STARTED_METRIC = "pattern_merges_started"
+MERGES_ENDED_METRIC = "pattern_merges_ended"
+MERGES_RUNNING_METRIC = "pattern_merges_running"
 # Column of the search latency table -> (metric, unit scale applied to the per-query value).
 WALK_PER_QUERY_METRICS = {
     "walk_us_per_query": ("pattern_search_walk_seconds_total", 1e6),
@@ -167,7 +174,8 @@ CPU_COLUMNS = [
 # p99 past the last bucket (300 s) reads as INDEX_LAG_OVERFLOW_S.
 # 'write_op_rate' is what the writer achieved, 'segments' and 'l0_rows' the layout the phase
 # ended with (rows in wide segments when the last rewrite was planned), and
-# 'rewrite_ranges_done' the rewrite work done during the phase.
+# 'rewrite_ranges_done' the rewrite work done during the phase. 'merges_started' and 'merges_ended'
+# are the merges the index's ticks asked for and saw end during the phase (MERGES_*_METRIC).
 INDEXING_LAG_METRIC = "indexing_lag_seconds"
 INDEXING_LAG_READER = "fine"
 INDEX_LAG_OVERFLOW_S = 600.0
@@ -178,6 +186,8 @@ INDEX_LAG_P99_COLUMN = "index_lag_p99_s"
 SEGMENTS_COLUMN = "segments"
 L0_ROWS_COLUMN = "l0_rows"
 REWRITE_RANGES_COLUMN = "rewrite_ranges_done"
+MERGES_STARTED_COLUMN = "merges_started"
+MERGES_ENDED_COLUMN = "merges_ended"
 INGEST_COLUMNS = [
     ColumnMetadata(name=INGESTED_ROWS_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=WRITE_OP_RATE_COLUMN, unit="op/s", type=ResultType.INTEGER),
@@ -186,6 +196,8 @@ INGEST_COLUMNS = [
     ColumnMetadata(name=SEGMENTS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
     ColumnMetadata(name=L0_ROWS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
     ColumnMetadata(name=REWRITE_RANGES_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=MERGES_STARTED_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=MERGES_ENDED_COLUMN, unit="", type=ResultType.INTEGER),
 ]
 # The writer: 'write_rate' rows a second from one loader, for the phase's duration plus
 # WRITER_TAIL_SECS -- it starts with the query phase and has the same start-up to go through, so
@@ -259,6 +271,31 @@ PROFILE_DELAY_SECS = 70
 PROFILE_SECS = 20
 PROFILE_HZ = 99
 PROFILE_STACK_BYTES = 8192
+# A fixed delay was not enough: run a0e51aa9's first profile, 70 s into its phase, recorded an idle
+# DB node (96% in the idle task) while the CPU window started a little later read it 83% busy --
+# latte's start-up varies from phase to phase. So PROFILE_SCRIPT waits PROFILE_MIN_DELAY_SECS, then
+# until the node's CPUs are PROFILE_BUSY_PCT busy over a second (for at most PROFILE_MAX_WAIT_SECS
+# in all), then PROFILE_SETTLE_SECS, and only then records; its log says how long it waited.
+PROFILE_MIN_DELAY_SECS = 20
+PROFILE_MAX_WAIT_SECS = 120
+PROFILE_BUSY_PCT = 25
+PROFILE_SETTLE_SECS = 10
+# Run as 'sh profile.sh <out> <hz> <stack bytes> <secs>' with the waits above baked in.
+PROFILE_SCRIPT = rf"""busy() {{
+    a=$(awk '/^cpu /{{print $2+$3+$4+$7+$8, $2+$3+$4+$5+$6+$7+$8+$9}}' /proc/stat)
+    sleep 1
+    b=$(awk '/^cpu /{{print $2+$3+$4+$7+$8, $2+$3+$4+$5+$6+$7+$8+$9}}' /proc/stat)
+    echo "$a $b" | awk '{{d = $4 - $2; print (d > 0 ? int(100 * ($3 - $1) / d) : 0)}}'
+}}
+sleep {PROFILE_MIN_DELAY_SECS}
+waited={PROFILE_MIN_DELAY_SECS}
+while [ "$waited" -lt {PROFILE_MAX_WAIT_SECS} ] && [ "$(busy)" -lt {PROFILE_BUSY_PCT} ]; do
+    waited=$((waited + 1))
+done
+echo "busy after $waited s; recording from $((waited + {PROFILE_SETTLE_SECS})) s"
+sleep {PROFILE_SETTLE_SECS}
+perf record -a -e cpu-clock -F "$2" --call-graph "dwarf,$3" -o "$1" -- sleep "$4"
+"""
 # Run on each node as 'sh cpu_window.sh <delay secs> <window secs> <out>': the node's CPU reading
 # (the clock, /proc/stat's 'cpu' line, and ScyllaDB's reactor busy times where there is a ScyllaDB)
 # into '<out>.a' PROFILE_DELAY_SECS into the phase and into '<out>.b' at the end of the window or
@@ -356,6 +393,52 @@ done
 
 class VectorStoreUnresponsive(RuntimeError):
     """The index node has answered no request for VS_UNRESPONSIVE_ABORT_SECS."""
+
+
+# The diagnostics -- CPU readings and windows, the thread sampler, profiles, the memory log -- reach
+# the nodes over SSH, and an SSH call has no bound of its own while it connects: run a0e51aa9's index
+# node, out of memory, still accepted connections, and the test sat in one for six minutes until it
+# was killed. So each such call is given its own timeout plus DIAGNOSTIC_GRACE_SECS (or
+# DIAGNOSTIC_DEFAULT_SECS when it has none) on a thread of its own, and abandoned past that; and the
+# index node's are not tried at all while it answers no HTTP request (VectorStoreUnresponsive's count).
+DIAGNOSTIC_GRACE_SECS = 30
+DIAGNOSTIC_DEFAULT_SECS = 120
+
+
+class DiagnosticSkipped(RuntimeError):
+    """A diagnostic SSH call given up on: past its bound, or to a node known not to answer."""
+
+
+class _BoundedRemoter:
+    """A node's remoter whose calls give up after their bound; see DIAGNOSTIC_GRACE_SECS."""
+
+    def __init__(self, remoter, node_name: str):
+        self._remoter = remoter
+        self._node_name = node_name
+
+    def __getattr__(self, name):
+        call = getattr(self._remoter, name)
+
+        def bounded(*args, **kwargs):
+            bound = (kwargs.get("timeout") or DIAGNOSTIC_DEFAULT_SECS) + DIAGNOSTIC_GRACE_SECS
+            outcome = {}
+
+            def target():
+                try:
+                    outcome["result"] = call(*args, **kwargs)
+                except BaseException as exc:  # noqa: BLE001 - handed to the caller below
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=target, name=f"diagnostic-{self._node_name}", daemon=True)
+            thread.start()
+            thread.join(bound)
+            if thread.is_alive():
+                raise DiagnosticSkipped(f"{name} on {self._node_name} still running after {bound:.0f} s; left behind")
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome["result"]
+
+        return bounded
 
 
 class SubstringIndexBuildResult(StaticGenericResultTable):
@@ -1274,6 +1357,8 @@ class SubstringSearchTest(SearchPerformanceTest):
             "segments": parse_index_gauge(metrics_text, SEGMENT_COUNT_METRIC, keyspace, index_name),
             "l0": parse_index_gauge(metrics_text, L0_DOCS_METRIC, keyspace, index_name),
             "ranges_done": parse_index_gauge(metrics_text, REWRITE_RANGES_DONE_METRIC, keyspace, index_name),
+            "merges_started": parse_index_gauge(metrics_text, MERGES_STARTED_METRIC, keyspace, index_name),
+            "merges_ended": parse_index_gauge(metrics_text, MERGES_ENDED_METRIC, keyspace, index_name),
         }
 
     @staticmethod
@@ -1286,9 +1371,26 @@ class SubstringSearchTest(SearchPerformanceTest):
             cells[SEGMENTS_COLUMN] = int(after["segments"])
         if after["l0"] is not None:
             cells[L0_ROWS_COLUMN] = int(after["l0"])
-        if before["ranges_done"] is not None and after["ranges_done"] is not None:
-            cells[REWRITE_RANGES_COLUMN] = int(max(after["ranges_done"] - before["ranges_done"], 0))
+        for key, column in (
+            ("ranges_done", REWRITE_RANGES_COLUMN),
+            ("merges_started", MERGES_STARTED_COLUMN),
+            ("merges_ended", MERGES_ENDED_COLUMN),
+        ):
+            # .get: a reading from before vector-store exported the merges has no such key.
+            if before.get(key) is not None and after.get(key) is not None:
+                cells[column] = int(max(after[key] - before[key], 0))
         return cells
+
+    def _diag(self, node) -> _BoundedRemoter:
+        """The node's remoter for a diagnostic: bounded, and refused for a silent index node."""
+        if getattr(self, "_vs_silent_since", None) is not None:
+            try:
+                is_vs = node is self._vector_store_node()
+            except Exception:  # noqa: BLE001 - no index node, so this is not it
+                is_vs = False
+            if is_vs:
+                raise DiagnosticSkipped(f"{node.name} answers no HTTP request; not reaching it over SSH either")
+        return _BoundedRemoter(node.remoter, node.name)
 
     def _cpu_window_nodes(self) -> list:
         """(key, node) for each CPU the window reads, as '_scrape_cpu' keys them."""
@@ -1308,9 +1410,9 @@ class SubstringSearchTest(SearchPerformanceTest):
         for key, node in self._cpu_window_nodes():
             try:
                 if node.name not in installed:
-                    node.remoter.run(f"echo {script} | base64 -d > /tmp/cpu_window.sh", verbose=False, timeout=30)
+                    self._diag(node).run(f"echo {script} | base64 -d > /tmp/cpu_window.sh", verbose=False, timeout=30)
                     installed.add(node.name)
-                node.remoter.run(
+                self._diag(node).run(
                     f"rm -f {out}.a {out}.b {out}.stop {out}.done; "
                     f"setsid sh /tmp/cpu_window.sh {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
                     f"> /dev/null 2>&1 < /dev/null &",
@@ -1331,13 +1433,17 @@ class SubstringSearchTest(SearchPerformanceTest):
         readings = ({}, {})
         for key, node, out in started:
             try:
-                text = node.remoter.run(
-                    f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out}.done ]; do sleep 1; done'; "
-                    f"cat {out}.a 2>/dev/null; echo '--- end of window ---'; cat {out}.b 2>/dev/null",
-                    ignore_status=True,
-                    verbose=False,
-                    timeout=60,
-                ).stdout
+                text = (
+                    self._diag(node)
+                    .run(
+                        f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out}.done ]; do sleep 1; done'; "
+                        f"cat {out}.a 2>/dev/null; echo '--- end of window ---'; cat {out}.b 2>/dev/null",
+                        ignore_status=True,
+                        verbose=False,
+                        timeout=60,
+                    )
+                    .stdout
+                )
             except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
                 self.log.warning("Could not read the CPU window on %s: %s", node.name, exc)
                 continue
@@ -1375,9 +1481,9 @@ class SubstringSearchTest(SearchPerformanceTest):
         try:
             if not getattr(self, "_sampler_installed", False):
                 script = base64.b64encode(VS_THREAD_SAMPLER.encode()).decode()
-                node.remoter.run(f"echo {script} | base64 -d > /tmp/vs_threads.sh", verbose=False, timeout=30)
+                self._diag(node).run(f"echo {script} | base64 -d > /tmp/vs_threads.sh", verbose=False, timeout=30)
                 self._sampler_installed = True
-            node.remoter.run(
+            self._diag(node).run(
                 f"rm -f {out} {out}.stop; setsid sh /tmp/vs_threads.sh vector-store {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
                 f"> /dev/null 2>&1 < /dev/null &",
                 verbose=False,
@@ -1394,13 +1500,13 @@ class SubstringSearchTest(SearchPerformanceTest):
             return {}
         node = self._vector_store_node()
         try:
-            node.remoter.run(
+            self._diag(node).run(
                 f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
                 ignore_status=True,
                 verbose=False,
                 timeout=60,
             )
-            text = node.remoter.run(f"cat {out}", ignore_status=True, verbose=False, timeout=30).stdout
+            text = self._diag(node).run(f"cat {out}", ignore_status=True, verbose=False, timeout=30).stdout
         except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
             self.log.warning("Could not read the index node's thread states: %s", exc)
             return {}
@@ -1425,9 +1531,9 @@ class SubstringSearchTest(SearchPerformanceTest):
         available = self.__dict__.setdefault("_perf_available", {})
         if node.name not in available:
             try:
-                if not node.remoter.sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
+                if not self._diag(node).sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
                     self._install_perf(node)
-                available[node.name] = node.remoter.sudo("perf --version", ignore_status=True, timeout=30).ok
+                available[node.name] = self._diag(node).sudo("perf --version", ignore_status=True, timeout=30).ok
             except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
                 self.log.warning("Could not install perf on %s: %s", node.name, exc)
                 available[node.name] = False
@@ -1435,21 +1541,20 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self.log.warning("perf does not run on %s; its profiles are skipped", node.name)
         return available[node.name]
 
-    @staticmethod
-    def _install_perf(node) -> None:
+    def _install_perf(self, node) -> None:
         """Install the running kernel's perf on an apt node, in bounded time.
 
         Not 'install_package', which retries a failed install for minutes: this runs between two
         query phases, and a package that is not there will not appear. A node without apt (the
         containerized backends) is left as it is.
         """
-        if not node.remoter.run("command -v apt-get", ignore_status=True, verbose=False, timeout=30).ok:
+        if not self._diag(node).run("command -v apt-get", ignore_status=True, verbose=False, timeout=30).ok:
             return
-        kernel = node.remoter.run("uname -r", verbose=False, timeout=30).stdout.strip()
-        node.remoter.sudo(
+        kernel = self._diag(node).run("uname -r", verbose=False, timeout=30).stdout.strip()
+        self._diag(node).sudo(
             "apt-get -o Acquire::http::Timeout=60 -o Acquire::Retries=3 update", ignore_status=True, timeout=300
         )
-        node.remoter.sudo(
+        self._diag(node).sudo(
             "DEBIAN_FRONTEND=noninteractive apt-get install "
             "-o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=60 -o Acquire::Retries=3 "
             '-o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" '
@@ -1460,12 +1565,22 @@ class SubstringSearchTest(SearchPerformanceTest):
         )
         # An HWE kernel's tools next to an older 'linux-tools-common', whose 'perf' wrapper then
         # looks under the wrong version ("perf not found for kernel"): the installed binary itself.
-        if not node.remoter.sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
-            node.remoter.sudo(
-                f"sh -c 'for p in /usr/lib/linux-tools/{kernel}/perf /usr/lib/linux-*-tools-*/perf; do "
-                '[ -x "$p" ] && ln -sf "$p" /usr/local/bin/perf && break; done\'',
+        # Searched for rather than guessed: run a0e51aa9's arm64 index node (6.14.0-1011-aws) had
+        # the tools package installed and its binary at neither path the guess named.
+        if not self._diag(node).sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
+            self._diag(node).sudo(
+                f'sh -c \'p=/usr/lib/linux-tools/{kernel}/perf; [ -x "$p" ] || '
+                'p=$(find /usr/lib -maxdepth 3 -type f -name perf -path "*tools*" -perm -u+x 2>/dev/null | sort -r | head -1); '
+                '[ -n "$p" ] && ln -sf "$p" /usr/local/bin/perf\'',
                 ignore_status=True,
                 timeout=30,
+            )
+        if not self._diag(node).sudo("perf --version", ignore_status=True, verbose=False, timeout=30).ok:
+            found = self._diag(node).run(
+                "ls -d /usr/lib/linux*tools* 2>&1", ignore_status=True, verbose=False, timeout=30
+            )
+            self.log.warning(
+                "No perf binary for kernel %s on %s; tools directories: %s", kernel, node.name, found.stdout.strip()
             )
 
     def _start_profiles(self, query: dict) -> list:
@@ -1481,16 +1596,17 @@ class SubstringSearchTest(SearchPerformanceTest):
             self.log.info("Profiling for %s as %s", query, ", ".join(name for _, name in started))
         return started
 
-    @staticmethod
-    def _start_profile(node, name: str) -> bool:
-        """Start a system-wide recording on the node in the background."""
-        record = (
-            f"sleep {PROFILE_DELAY_SECS}; perf record -a -e cpu-clock -F {PROFILE_HZ} "
-            f"--call-graph dwarf,{PROFILE_STACK_BYTES} -o /tmp/{name}.data -- sleep {PROFILE_SECS}"
-        )
+    def _start_profile(self, node, name: str) -> bool:
+        """Start PROFILE_SCRIPT on the node in the background: a system-wide recording once the
+        node is busy."""
+        script = base64.b64encode(PROFILE_SCRIPT.encode()).decode()
         try:
-            node.remoter.sudo(
-                f"setsid sh -c '{record}' > /tmp/{name}.log 2>&1 < /dev/null &", verbose=False, timeout=30
+            self._diag(node).run(f"echo {script} | base64 -d > /tmp/profile.sh", verbose=False, timeout=30)
+            self._diag(node).sudo(
+                f"setsid sh /tmp/profile.sh /tmp/{name}.data {PROFILE_HZ} {PROFILE_STACK_BYTES} {PROFILE_SECS} "
+                f"> /tmp/{name}.log 2>&1 < /dev/null &",
+                verbose=False,
+                timeout=30,
             )
         except Exception:  # noqa: BLE001 - a profile is an extra, not the measurement
             return False
@@ -1502,20 +1618,20 @@ class SubstringSearchTest(SearchPerformanceTest):
         # '[p]erf-...' so that the pattern does not match the waiting shell's own command line.
         pattern = f"/tmp/[{name[0]}]{name[1:]}.data"
         try:
-            node.remoter.run(
-                f"timeout {PROFILE_DELAY_SECS + PROFILE_SECS + 60} sh -c "
+            self._diag(node).run(
+                f"timeout {PROFILE_MAX_WAIT_SECS + PROFILE_SETTLE_SECS + PROFILE_SECS + 60} sh -c "
                 f"'while pgrep -f \"{pattern}\" > /dev/null; do sleep 2; done'",
                 ignore_status=True,
                 verbose=False,
-                timeout=PROFILE_DELAY_SECS + PROFILE_SECS + 90,
+                timeout=PROFILE_MAX_WAIT_SECS + PROFILE_SETTLE_SECS + PROFILE_SECS + 90,
             )
-            log = node.remoter.sudo(f"tail -3 /tmp/{name}.log", ignore_status=True, verbose=False).stdout.strip()
+            log = self._diag(node).sudo(f"tail -3 /tmp/{name}.log", ignore_status=True, verbose=False).stdout.strip()
             self.log.info("Profile %s: %s", name, log.replace("\n", " | "))
             # One root shell for both: 'sudo a && b' would run b as the login user, on a root-owned file.
-            node.remoter.sudo(f"sh -c 'gzip -1 -f /tmp/{name}.data && chmod 644 /tmp/{name}.data.gz'", timeout=300)
+            self._diag(node).sudo(f"sh -c 'gzip -1 -f /tmp/{name}.data && chmod 644 /tmp/{name}.data.gz'", timeout=300)
             os.makedirs(dest, exist_ok=True)
-            node.remoter.receive_files(src=f"/tmp/{name}.data.gz", dst=dest, timeout=600)
-            node.remoter.sudo(f"rm -f /tmp/{name}.data.gz", ignore_status=True, verbose=False)
+            self._diag(node).receive_files(src=f"/tmp/{name}.data.gz", dst=dest, timeout=600)
+            self._diag(node).sudo(f"rm -f /tmp/{name}.data.gz", ignore_status=True, verbose=False)
         except Exception as exc:  # noqa: BLE001 - a profile is an extra, not the measurement
             self.log.warning("Could not collect profile %s: %s", name, exc)
 
@@ -1533,7 +1649,7 @@ class SubstringSearchTest(SearchPerformanceTest):
         )
         for key, node, cmd, parse in reads:
             try:
-                result = node().remoter.run(cmd, ignore_status=True, verbose=False, timeout=30)
+                result = self._diag(node()).run(cmd, ignore_status=True, verbose=False, timeout=30)
                 value = parse(result.stdout) if result.ok else None
             except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
                 self.log.warning("Could not read the %s CPU: %s", key, exc)
@@ -1764,15 +1880,23 @@ class SubstringSearchTest(SearchPerformanceTest):
             ranges_total = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_TOTAL_METRIC) or 0
             ranges_done = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_DONE_METRIC) or 0
             rewriting = ranges_done < ranges_total
+            # A segment count can hold still while merges run, and run a0e51aa9's did, for ten
+            # minutes, with a backlog of thousands; a vector-store without the gauge reads as none.
+            merging = self._read_index_gauge(keyspace, index_name, MERGES_RUNNING_METRIC) or 0
             if rewriting:
                 self.log.info(
-                    "Index '%s' rewriting wide segments: %d of %d ranges moved, %d segments",
+                    "Index '%s' rewriting wide segments: %d of %d ranges moved, %d segments, %d merges running",
                     index_name,
                     int(ranges_done),
                     int(ranges_total),
                     int(segments),
+                    int(merging),
                 )
-            stable = stable + 1 if segments == previous and not rewriting else 0
+            elif merging:
+                self.log.info(
+                    "Index '%s' merging: %d merges running, %d segments", index_name, int(merging), int(segments)
+                )
+            stable = stable + 1 if segments == previous and not rewriting and not merging else 0
             previous = segments
             if stable >= SETTLE_STABLE_POLLS:
                 self.log.info(
@@ -1874,8 +1998,10 @@ class SubstringSearchTest(SearchPerformanceTest):
         script = base64.b64encode(VS_MEMORY_LOG_SCRIPT.encode()).decode()
         try:
             node = self._vector_store_node()
-            node.remoter.run(f"echo {script} | base64 -d > /tmp/vs_memory.sh", verbose=False, timeout=30)
-            node.remoter.run("setsid sh /tmp/vs_memory.sh > /dev/null 2>&1 < /dev/null &", verbose=False, timeout=30)
+            self._diag(node).run(f"echo {script} | base64 -d > /tmp/vs_memory.sh", verbose=False, timeout=30)
+            self._diag(node).run(
+                "setsid sh /tmp/vs_memory.sh > /dev/null 2>&1 < /dev/null &", verbose=False, timeout=30
+            )
         except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
             self.log.warning("Could not start the memory log on the vector-store node: %s", exc)
 
