@@ -501,9 +501,21 @@ real index will be larger. And the figure is the index node's own gauge, not res
 What follows for the instance types:
 
 `instance_type_vector_store`
-: memory can be modest -- `c8g.xlarge` gives 8 GiB, several times the headroom needed. The vCPU
-  count should not be cut, because the index node serves the queries and its cores are what set the
-  throughput ceiling this run measures.
+: memory is what limits how many indexes a run can hold. A pattern index lives in RAM
+  (`create_in_ram`), and the process holds far more than the size gauge above: measured locally on
+  2026-11-02 (1M names, three ordered indexes, default options, `vector_store_threads: 4` as on a
+  4-vCPU node), about 0.2 GB plus 0.27-0.31 GB per index per 1M names once settled, and about 1.3
+  times that at the peak of the ingest. Three ordered indexes of 10M names are therefore about
+  8.5 GB settled, more than `c8g.xlarge`'s 8 GiB: run fd5928db's node ran out in the rewrite after
+  the load. Measure with the threads capped: on a 22-thread laptop every index gets a writer thread
+  per core, each with its own buffer, and the reading doubles.
+  For more memory keep the vCPUs: `r8g.xlarge` has the same 4 Graviton cores with 32 GiB. The vCPU
+  count should not be cut or raised, because the index node serves the queries and its cores are
+  what set the throughput ceiling this run measures.
+  An index node out of memory does not crash; it stops answering. The test gives up once the node
+  has answered no scrape or status poll for 3 minutes (`VS_UNRESPONSIVE_ABORT_SECS`), and logs the
+  node's available memory and the vector-store RSS once a minute to its journal (`vs-memory` in
+  `hosts/<vs node>/messages.log`), which the runner keeps as it is written.
 
 `instance_type_db`
 : not idle. Every containment query returns up to `limit` primary keys and Scylla then reads those

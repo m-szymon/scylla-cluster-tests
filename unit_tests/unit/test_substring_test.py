@@ -616,6 +616,82 @@ def test_an_index_that_never_answers_still_times_out(monkeypatch):
         test._wait_for_indexes_count("ks", ["idx"], 10, timeout=60)
 
 
+def _sleeps_move_the_clock(monkeypatch):
+    """A clock that only the waits' sleeps advance, so that a poll count is a span of time."""
+    now = [0.0]
+    monkeypatch.setattr(substring_test.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(substring_test.time, "sleep", lambda secs: now.__setitem__(0, now[0] + secs))
+
+
+def test_an_index_node_silent_for_minutes_ends_the_wait_long_before_its_deadline(monkeypatch):
+    """Run fd5928db polled a node that had run out of memory for 47 minutes; now it gives up."""
+    client = _FlakyStatusClient([requests.exceptions.ReadTimeout("read timed out")] * 1000)
+    test = _test_waiting_on(client, monkeypatch)
+    _sleeps_move_the_clock(monkeypatch)
+    with pytest.raises(substring_test.VectorStoreUnresponsive):
+        test._wait_for_indexes_count("ks", ["idx"], 10, timeout=7200)
+    polls_to_give_up = 1000 - len(client.answers)
+    assert (
+        polls_to_give_up
+        <= substring_test.VS_UNRESPONSIVE_ABORT_SECS / substring_test.INDEX_COUNT_POLL_INTERVAL_SECS + 2
+    )
+
+
+def test_an_answer_restarts_the_count_of_silence(monkeypatch):
+    """Silences shorter than VS_UNRESPONSIVE_ABORT_SECS, one after another, are missed samples."""
+    timeout = requests.exceptions.ReadTimeout("read timed out")
+    gaps = int(substring_test.VS_UNRESPONSIVE_ABORT_SECS / substring_test.INDEX_COUNT_POLL_INTERVAL_SECS) - 2
+    client = _FlakyStatusClient([timeout] * gaps + [5] + [timeout] * gaps + [10])
+    test = _test_waiting_on(client, monkeypatch)
+    _sleeps_move_the_clock(monkeypatch)
+    test._wait_for_indexes_count("ks", ["idx"], 10, timeout=7200)
+    assert client.answers == []
+
+
+class _MetricsClient:
+    """A vector-store client whose /metrics answers come from a list: text, or an exception to raise."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def request(self, method, path):
+        assert (method, path) == ("GET", "/metrics")
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return dataclasses.make_dataclass("Response", ["text"])(answer)
+
+
+def test_a_missed_scrape_is_no_reading_but_a_silent_node_ends_the_run(monkeypatch):
+    client = _MetricsClient([requests.exceptions.ReadTimeout("read timed out")] * 100)
+    test = _test_waiting_on(client, monkeypatch)
+    clock = iter(range(0, 100000, 30))
+    monkeypatch.setattr(substring_test.time, "monotonic", lambda: next(clock))
+    assert test._try_vs_metrics("idx") is None
+    with pytest.raises(substring_test.VectorStoreUnresponsive):
+        for _ in range(100):
+            test._try_vs_metrics("idx")
+
+
+def test_the_cdc_wait_gives_up_on_a_silent_node_rather_than_waiting_out_the_settle_timeout(monkeypatch):
+    client = _MetricsClient([requests.exceptions.ConnectionError("refused")] * 1000)
+    test = _test_waiting_on(client, monkeypatch)
+    test._max_settle = 1800
+    clock = iter(range(0, 100000, 10))
+    monkeypatch.setattr(substring_test.time, "monotonic", lambda: next(clock))
+    with pytest.raises(substring_test.VectorStoreUnresponsive):
+        test._wait_for_cdc_quiet("ks", ["idx"])
+
+
+def test_the_memory_log_script_reads_meminfo_and_the_process(tmp_path):
+    """The script's one iteration, with logger and sleep swapped for an echo and an exit."""
+    script = substring_test.VS_MEMORY_LOG_SCRIPT.replace("logger -t vs-memory", "echo").replace("sleep 60", "break")
+    path = tmp_path / "vs_memory.sh"
+    path.write_text(script)
+    out = subprocess.run(["sh", str(path)], capture_output=True, text=True, check=True).stdout
+    assert re.fullmatch(r"total_mb=\d+ available_mb=\d+ vector_store_rss_mb=\d+\n", out), out
+
+
 class _FakeRemoter:
     def __init__(self, has_apt, perf_runs=True):
         self.has_apt = has_apt
