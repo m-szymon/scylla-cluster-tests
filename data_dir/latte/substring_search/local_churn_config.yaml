@@ -1,0 +1,39 @@
+# Run a0e51aa9's second dataset, locally, to reproduce what broke it.
+#
+# On AWS (2026-11-02) the table-order index of names_10M_unordered -- loaded next to an unordered
+# index, both with default options -- caught up in 136 s and then never settled: about 2000 merges a
+# minute held it at 500-780 segments. It went on merging after it was dropped, and the index node's
+# memory grew from 8 to 29.5 GB in four minutes until it stopped answering. The first dataset's
+# table-order index, loaded next to two others and ingesting for 500 s, settled at 55 segments.
+#
+# Same indexes, options and queries at 1M names; run with vector_store_threads 4 and the memory and
+# merge sampler (memory_local_chain.sh). The first round queries the table-order index, then drops
+# it, as the AWS run did; the second queries the unordered one.
+#
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/local_churn_config.yaml
+datasets:
+  - name: names_1M_matrix
+    index_during_load: true
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 3600
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: unordered
+        order: unordered
+        options: {}
+    defaults:
+      limit: 20
+      concurrency: 8
+      rate: 0
+      duration: 30s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2}
+          - {set: char8_common}
+          - {set: miss}
+          - {set: char2, write_rate: 2000}

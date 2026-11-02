@@ -683,6 +683,47 @@ def test_the_cdc_wait_gives_up_on_a_silent_node_rather_than_waiting_out_the_sett
         test._wait_for_cdc_quiet("ks", ["idx"])
 
 
+class _SlowRemoter:
+    def __init__(self, secs):
+        self.secs = secs
+
+    def run(self, cmd, **_):
+        time.sleep(self.secs)
+        return cmd
+
+    def sudo(self, cmd, **_):
+        raise ValueError(cmd)
+
+
+def test_a_diagnostic_ssh_call_that_hangs_is_abandoned_at_its_bound(monkeypatch):
+    """Run a0e51aa9 sat six minutes in one call to an index node out of memory."""
+    monkeypatch.setattr(substring_test, "DIAGNOSTIC_GRACE_SECS", 0)
+    remoter = substring_test._BoundedRemoter(_SlowRemoter(5), "vs-1")
+    started = time.monotonic()
+    with pytest.raises(substring_test.DiagnosticSkipped):
+        remoter.run("head -1 /proc/stat", timeout=0.2)
+    assert time.monotonic() - started < 2
+
+
+def test_a_bounded_diagnostic_call_returns_or_raises_as_the_call_does():
+    remoter = substring_test._BoundedRemoter(_SlowRemoter(0), "db-1")
+    assert remoter.run("uptime", timeout=5) == "uptime"
+    with pytest.raises(ValueError):
+        remoter.sudo("false", timeout=5)
+
+
+def test_a_silent_index_node_is_not_reached_over_ssh_either():
+    test = object.__new__(substring_test.SubstringSearchTest)
+    vs = dataclasses.make_dataclass("Node", [("remoter", object), ("name", str)])(_SlowRemoter(0), "vs-1")
+    db = dataclasses.make_dataclass("Node", [("remoter", object), ("name", str)])(_SlowRemoter(0), "db-1")
+    test._vector_store_node = lambda: vs
+    assert test._diag(vs).run("uptime") == "uptime"
+    test._vs_silent_since = 0.0
+    with pytest.raises(substring_test.DiagnosticSkipped):
+        test._diag(vs)
+    assert test._diag(db).run("uptime") == "uptime"
+
+
 def test_the_memory_log_script_reads_meminfo_and_the_process(tmp_path):
     """The script's one iteration, with logger and sleep swapped for an echo and an exit."""
     script = substring_test.VS_MEMORY_LOG_SCRIPT.replace("logger -t vs-memory", "echo").replace("sleep 60", "break")
@@ -710,9 +751,15 @@ class _FakeRemoter:
         return dataclasses.make_dataclass("R", [("ok", bool)])(True)
 
 
+def _installer():
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.log = logging.getLogger("test_substring_test")
+    return test
+
+
 def test_perf_is_installed_with_bounded_apt_calls():
-    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=True))
-    substring_test.SubstringSearchTest._install_perf(node)
+    node = dataclasses.make_dataclass("Node", [("remoter", object), ("name", str)])(_FakeRemoter(has_apt=True), "n")
+    _installer()._install_perf(node)
     update, install = node.remoter.sudo_cmds
     assert "Acquire::http::Timeout=60" in update[0] and update[1]["timeout"]
     assert install[0].startswith("DEBIAN_FRONTEND=noninteractive apt-get install")
@@ -722,17 +769,35 @@ def test_perf_is_installed_with_bounded_apt_calls():
 
 
 def test_perf_binary_is_linked_when_the_wrapper_misses_the_kernel():
-    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=True, perf_runs=False))
-    substring_test.SubstringSearchTest._install_perf(node)
+    node = dataclasses.make_dataclass("Node", [("remoter", object), ("name", str)])(
+        _FakeRemoter(has_apt=True, perf_runs=False), "n"
+    )
+    _installer()._install_perf(node)
     _, _, link = node.remoter.sudo_cmds
     assert "/usr/lib/linux-tools/6.8.0-1017-aws/perf" in link[0]
+    # Searched for, not guessed (run a0e51aa9's arm64 node had it at neither guessed path).
+    assert "find /usr/lib" in link[0] and "-name perf" in link[0]
     assert "ln -sf" in link[0] and "/usr/local/bin/perf" in link[0]
 
 
 def test_perf_is_not_installed_without_apt():
-    node = dataclasses.make_dataclass("Node", [("remoter", object)])(_FakeRemoter(has_apt=False))
-    substring_test.SubstringSearchTest._install_perf(node)
+    node = dataclasses.make_dataclass("Node", [("remoter", object), ("name", str)])(_FakeRemoter(has_apt=False), "n")
+    _installer()._install_perf(node)
     assert node.remoter.sudo_cmds == []
+
+
+def test_the_profile_waits_on_a_busy_reading_of_the_node():
+    """PROFILE_SCRIPT's 'busy' function, run once: a whole percentage of the CPUs busy over a second."""
+    busy = substring_test.PROFILE_SCRIPT.split("\n}\n", 1)[0] + "\n}\nbusy\n"
+    out = subprocess.run(["sh", "-c", busy], capture_output=True, text=True, check=True).stdout
+    assert re.fullmatch(r"\d+\n", out) and 0 <= int(out) <= 100, out
+
+
+def test_the_profile_records_only_after_its_waits():
+    script = substring_test.PROFILE_SCRIPT
+    assert script.index(f"sleep {substring_test.PROFILE_MIN_DELAY_SECS}") < script.index("perf record")
+    assert f"-lt {substring_test.PROFILE_BUSY_PCT} ]" in script
+    assert script.index(f"sleep {substring_test.PROFILE_SETTLE_SECS}") < script.index("perf record")
 
 
 # --- writers, lag and the CPU window ---------------------------------------------------------------
@@ -793,11 +858,64 @@ def test_a_phase_without_writes_has_no_lag_and_a_missing_scrape_no_cells():
 def test_every_ingest_quantity_is_a_column():
     names = {column.name for column in substring_test.INGEST_COLUMNS}
     test = substring_test.SubstringSearchTest
-    before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "l0": 0.0, "ranges_done": 3.0}
-    after = {"lag": _lag((5, 5, 5, 5, 5), 0.1), "segments": 41.0, "l0": 1000.0, "ranges_done": 7.0}
+    before = {
+        "lag": _lag((0,) * 5, 0.0),
+        "segments": 40.0,
+        "l0": 0.0,
+        "ranges_done": 3.0,
+        "merges_started": 10.0,
+        "merges_ended": 9.0,
+    }
+    after = {
+        "lag": _lag((5, 5, 5, 5, 5), 0.1),
+        "segments": 41.0,
+        "l0": 1000.0,
+        "ranges_done": 7.0,
+        "merges_started": 25.0,
+        "merges_ended": 21.0,
+    }
     cells = test._ingest_cells(before, after)
     assert set(cells) | {substring_test.WRITE_OP_RATE_COLUMN} == names
     assert cells[substring_test.REWRITE_RANGES_COLUMN] == 4
+    assert cells[substring_test.MERGES_STARTED_COLUMN] == 15
+    assert cells[substring_test.MERGES_ENDED_COLUMN] == 12
+
+
+def test_a_vector_store_without_merge_gauges_leaves_their_cells_empty():
+    before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "l0": 0.0, "ranges_done": 3.0}
+    cells = substring_test.SubstringSearchTest._ingest_cells(before, dict(before))
+    assert substring_test.MERGES_STARTED_COLUMN not in cells
+
+
+def _settling(monkeypatch, readings):
+    """A test whose gauges read off 'readings', one dict per poll; sleeps advance a clock."""
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.log = logging.getLogger("test_substring_test")
+    test._max_settle = 3600
+    polls = iter(readings)
+    current = {}
+
+    def read(_keyspace, _index, metric):
+        if metric == substring_test.SEGMENT_COUNT_METRIC:
+            current.clear()
+            current.update(next(polls))
+        return current.get(metric)
+
+    test._read_index_gauge = read
+    now = [0.0]
+    monkeypatch.setattr(substring_test.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(substring_test.time, "sleep", lambda secs: now.__setitem__(0, now[0] + secs))
+    return test, now
+
+
+def test_an_index_with_merges_running_is_not_settled_however_still_its_segment_count(monkeypatch):
+    """Run a0e51aa9's index held 712 segments for three polls with thousands of merges queued."""
+    segments, running = substring_test.SEGMENT_COUNT_METRIC, substring_test.MERGES_RUNNING_METRIC
+    readings = [{segments: 712, running: 36}] * 6 + [{segments: 700, running: 0}] * 4
+    test, now = _settling(monkeypatch, readings)
+    test._wait_for_index_settled("ks", "idx", timeout=3600)
+    # Settled on the polls after the merges stopped, not on the first three still ones.
+    assert now[0] >= 8 * substring_test.SETTLE_POLL_INTERVAL_SECS
 
 
 def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():
