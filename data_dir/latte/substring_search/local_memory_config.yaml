@@ -1,0 +1,39 @@
+# The vector-store node's memory through the life of aws_orders_config.yaml's first dataset, locally.
+#
+# Run fd5928db (2026-11-02) froze its 8 GB index node about 3 min after the three ordered indexes of
+# 10M names caught up and their rewrite began. This plan does the same at 1M names: the same three
+# indexes with the same (default) options, loaded while indexing, left to settle, then queried
+# shortly and written to, so that a sampler of the index container's memory sees the ingest, the
+# rewrite, the settled state and a writer. Nothing here is a performance number.
+#
+#   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/local_memory_config.yaml
+datasets:
+  - name: names_1M_matrix
+    index_during_load: true
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 3600
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: tier
+        order: tie
+        options: {}
+      - label: time
+        options: {}
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 20s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2, variants: [table]}
+          - {set: char2, write_rate: 500, variants: [table]}
+          - {set: char2, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char2, ordered: true, order_column: tier, write_rate: 500, write_values: random, variants: [tier]}
+          - {set: char2, ordered: true, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 500, write_values: random, variants: [time]}

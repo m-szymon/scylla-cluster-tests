@@ -336,6 +336,26 @@ SETTLE_STABLE_POLLS = 3
 CDC_QUIET_POLLS = 2
 CDC_QUIET_CHANGES = 100
 DEFAULT_SETTLE_TIMEOUT_SECS = 600
+# A missed scrape or status poll is one lost sample (the runner reaches the index node over the
+# internet), but an index node that answers nothing for this long is gone: run fd5928db's ran out
+# of memory at 09:24:55, and the run polled it for 47 more minutes before a query probe failed.
+VS_UNRESPONSIVE_ABORT_SECS = 180
+
+
+# The index node's memory once a minute, into its journal, which reaches the runner's copy of the
+# node's log (hosts/<node>/messages.log) as it is written: a pattern index lives in RAM, and when
+# the node runs out, its log is all that is left of it (run fd5928db's stopped mid-line).
+VS_MEMORY_LOG_SCRIPT = r"""while true; do
+  m=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "total_mb=%d available_mb=%d", t/1024, a/1024}' /proc/meminfo)
+  r=$(ps -C vector-store -o rss= | awk '{s+=$1} END{printf "%d", s/1024}')
+  logger -t vs-memory "$m vector_store_rss_mb=$r"
+  sleep 60
+done
+"""
+
+
+class VectorStoreUnresponsive(RuntimeError):
+    """The index node has answered no request for VS_UNRESPONSIVE_ABORT_SECS."""
 
 
 class SubstringIndexBuildResult(StaticGenericResultTable):
@@ -1101,7 +1121,7 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _scrape_search_totals(self, keyspace, index_names) -> dict[str, float]:
         """'pattern_search_total' per index, for the ones that export it."""
-        metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
+        metrics_text = self._vs_metrics()
         totals = {}
         for name in index_names:
             value = parse_index_gauge(metrics_text, SEARCHES_METRIC, keyspace, name)
@@ -1246,10 +1266,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         if queried is None:
             return None
         keyspace, index_name = queried
-        try:
-            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
-        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
-            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+        metrics_text = self._try_vs_metrics(index_name)
+        if metrics_text is None:
             return None
         return {
             "lag": parse_indexing_lag(metrics_text, keyspace, index_name),
@@ -1530,10 +1548,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         if queried is None:
             return None
         keyspace, index_name = queried
-        try:
-            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
-        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
-            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+        metrics_text = self._try_vs_metrics(index_name)
+        if metrics_text is None:
             return None
         totals = {}
         for metric in [SEARCHES_METRIC] + [metric for metric, _ in WALK_PER_QUERY_METRICS.values()]:
@@ -1578,10 +1594,50 @@ class SubstringSearchTest(SearchPerformanceTest):
         caller's deadline still bounds the wait.
         """
         try:
-            return client.get_index_status_or_none(keyspace.lower(), index_name.lower())
+            status = client.get_index_status_or_none(keyspace.lower(), index_name.lower())
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            self._note_vs_answer(answered=False)
             self.log.warning("No status for index '%s' this time, polling on: %s", index_name, exc)
             return self.UNANSWERED
+        self._note_vs_answer(answered=True)
+        return status
+
+    def _note_vs_answer(self, answered: bool):
+        """Track how long the index node has answered nothing; past VS_UNRESPONSIVE_ABORT_SECS of
+        silence, raise VectorStoreUnresponsive rather than poll a dead node until a deadline."""
+        now = time.monotonic()
+        if answered:
+            self._vs_silent_since = None
+            return
+        since = getattr(self, "_vs_silent_since", None)
+        if since is None:
+            self._vs_silent_since = now
+        elif now - since >= VS_UNRESPONSIVE_ABORT_SECS:
+            raise VectorStoreUnresponsive(
+                f"The vector-store node has answered no request for {now - since:.0f} s; giving up on the run"
+            )
+
+    def _vs_metrics(self) -> str:
+        """The index node's /metrics text. A failed scrape raises, and counts towards giving up."""
+        try:
+            text = self._vector_store_api_client().request("GET", "/metrics").text
+        except requests.exceptions.ConnectionError, requests.exceptions.Timeout:
+            self._note_vs_answer(answered=False)
+            raise
+        self._note_vs_answer(answered=True)
+        return text
+
+    def _try_vs_metrics(self, index_name: str | None = None) -> str | None:
+        """'_vs_metrics', or None after a warning: a missed scrape must not end the run, unless the
+        node has gone silent for good (VectorStoreUnresponsive)."""
+        try:
+            return self._vs_metrics()
+        except VectorStoreUnresponsive:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
+            target = f" for '{index_name}'" if index_name else ""
+            self.log.warning("Could not scrape vector-store metrics%s: %s", target, exc)
+            return None
 
     def _wait_for_indexes_count(self, keyspace, index_names, record_count, timeout) -> dict[str, float]:
         """Wait until every named index holds every loaded row; per index, how long after the load
@@ -1665,10 +1721,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         started = time.monotonic()
         previous, quiet = None, 0
         while time.monotonic() - started < self._max_settle:
-            try:
-                metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
-            except Exception as exc:  # noqa: BLE001 - one missed poll
-                self.log.warning("Could not scrape vector-store metrics: %s", exc)
+            metrics_text = self._try_vs_metrics()
+            if metrics_text is None:
                 time.sleep(SETTLE_POLL_INTERVAL_SECS)
                 continue
             totals = {name: cdc_changes_total(metrics_text, keyspace, name) or 0.0 for name in index_names}
@@ -1740,10 +1794,8 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _read_index_gauge(self, keyspace, index_name, metric) -> float | None:
         """One vector-store gauge for one index, or None if it cannot be read."""
-        try:
-            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
-        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
-            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+        metrics_text = self._try_vs_metrics(index_name)
+        if metrics_text is None:
             return None
         return parse_index_gauge(metrics_text, metric, keyspace, index_name)
 
@@ -1754,10 +1806,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         missing build time is: the index answers queries either way, and the query phase that
         follows is the more important half of the run.
         """
-        try:
-            metrics_text = self._vector_store_api_client().request("GET", "/metrics").text
-        except Exception as exc:  # noqa: BLE001 - a scrape failure must not end the run
-            self.log.warning("Could not scrape vector-store metrics for '%s': %s", index_name, exc)
+        metrics_text = self._try_vs_metrics(index_name)
+        if metrics_text is None:
             return
 
         size_bytes = parse_index_gauge(metrics_text, INDEX_SIZE_METRIC, keyspace, index_name)
@@ -1819,5 +1869,16 @@ class SubstringSearchTest(SearchPerformanceTest):
                 )
         submit_results_to_argus(self.test_config.argus_client(), result_table)
 
+    def _start_vs_memory_log(self):
+        """Start VS_MEMORY_LOG_SCRIPT on the index node; a diagnostic, so a failure only warns."""
+        script = base64.b64encode(VS_MEMORY_LOG_SCRIPT.encode()).decode()
+        try:
+            node = self._vector_store_node()
+            node.remoter.run(f"echo {script} | base64 -d > /tmp/vs_memory.sh", verbose=False, timeout=30)
+            node.remoter.run("setsid sh /tmp/vs_memory.sh > /dev/null 2>&1 < /dev/null &", verbose=False, timeout=30)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
+            self.log.warning("Could not start the memory log on the vector-store node: %s", exc)
+
     def test_substring_search(self):
+        self._start_vs_memory_log()
         self.run_search_benchmark()

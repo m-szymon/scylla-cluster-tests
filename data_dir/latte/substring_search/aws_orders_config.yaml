@@ -27,7 +27,9 @@
 #   pruning or not.
 #
 # Two datasets, because the index node holds three indexes of 10M names (run 4c4b7647 thrashed
-# with six). Each round drops its index when it is done, so the writes pile up on fewer indexes
+# with six) -- and only on more memory than the test case's c8g.xlarge: a pattern index lives in
+# RAM, about 0.3 GB per 1M names, and run fd5928db's 8 GB node froze in the rewrite after the load.
+# Run on r8g.xlarge (the same 4 vCPUs, 32 GB): about 14 GB at the peak of the first round. Each round drops its index when it is done, so the writes pile up on fewer indexes
 # as the dataset goes on: round 1 ingests into three, round 3 into one. A round's rows are
 # comparable with each other; across rounds the table has grown by what the earlier rounds wrote
 # (about 1M rows a round), and the last phase of the register_time round, char2 with no writer
@@ -43,7 +45,7 @@
 #
 # Run with the case-sensitive overlay and the release package of scylladb 8f3590ce22 or later; the
 # vector-store node builds pattern-index-poc from GitHub:
-#   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config port_aws_chain.sh
+#   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config VS_TYPE=r8g.xlarge port_aws_chain.sh
 #
 # Budget: provisioning ~20 min; A: load and ingest of three indexes ~35 min, 21 phases at ~2.3 min
 # ~50 min, 3 profiles ~12 min; B: load and ingest of two ~30 min, 8 phases ~18 min; log collection
