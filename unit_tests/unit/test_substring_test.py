@@ -873,18 +873,26 @@ def test_every_ingest_quantity_is_a_column():
         "ranges_done": 7.0,
         "merges_started": 25.0,
         "merges_ended": 21.0,
+        "depth_max": 3.0,
+        "depth_mean": 1.234,
+        "rows_over_tolerance": 500.0,
+        "rows_deleted": 7.0,
     }
     cells = test._ingest_cells(before, after)
     assert set(cells) | {substring_test.WRITE_OP_RATE_COLUMN} == names
     assert cells[substring_test.REWRITE_RANGES_COLUMN] == 4
     assert cells[substring_test.MERGES_STARTED_COLUMN] == 15
     assert cells[substring_test.MERGES_ENDED_COLUMN] == 12
+    assert cells[substring_test.DEPTH_MAX_COLUMN] == 3
+    assert cells[substring_test.DEPTH_MEAN_COLUMN] == 1.23
+    assert cells[substring_test.ROWS_OVER_TOLERANCE_COLUMN] == 500
 
 
 def test_a_vector_store_without_merge_gauges_leaves_their_cells_empty():
     before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "l0": 0.0, "ranges_done": 3.0}
     cells = substring_test.SubstringSearchTest._ingest_cells(before, dict(before))
     assert substring_test.MERGES_STARTED_COLUMN not in cells
+    assert substring_test.DEPTH_MAX_COLUMN not in cells
 
 
 def _settling(monkeypatch, readings):
