@@ -114,6 +114,16 @@ L0_DOCS_METRIC = "pattern_l0_docs"
 MERGES_STARTED_METRIC = "pattern_merges_started"
 MERGES_ENDED_METRIC = "pattern_merges_ended"
 MERGES_RUNNING_METRIC = "pattern_merges_running"
+# How far an ordered index's segments are from disjoint, by their bounds: the most segments over
+# one sort key, that count per row on average (1 is a disjoint layout, what the ordered walk
+# prunes best), the rows in segments covered more than twice, and the deleted rows not merged
+# away yet. Absent from a vector-store older than the gauges.
+LAYOUT_GAUGE_METRICS = {
+    "depth_max": "pattern_layout_depth_max",
+    "depth_mean": "pattern_layout_depth_mean",
+    "rows_over_tolerance": "pattern_layout_rows_over_tolerance",
+    "rows_deleted": "pattern_layout_rows_deleted",
+}
 # Column of the search latency table -> (metric, unit scale applied to the per-query value).
 WALK_PER_QUERY_METRICS = {
     "walk_us_per_query": ("pattern_search_walk_seconds_total", 1e6),
@@ -176,6 +186,8 @@ CPU_COLUMNS = [
 # ended with (rows in wide segments when the last rewrite was planned), and
 # 'rewrite_ranges_done' the rewrite work done during the phase. 'merges_started' and 'merges_ended'
 # are the merges the index's ticks asked for and saw end during the phase (MERGES_*_METRIC).
+# 'depth_max', 'depth_mean', 'rows_over_tolerance' and 'rows_deleted' are the layout's overlap the
+# phase ended with (LAYOUT_GAUGE_METRICS).
 INDEXING_LAG_METRIC = "indexing_lag_seconds"
 INDEXING_LAG_READER = "fine"
 INDEX_LAG_OVERFLOW_S = 600.0
@@ -188,6 +200,10 @@ L0_ROWS_COLUMN = "l0_rows"
 REWRITE_RANGES_COLUMN = "rewrite_ranges_done"
 MERGES_STARTED_COLUMN = "merges_started"
 MERGES_ENDED_COLUMN = "merges_ended"
+DEPTH_MAX_COLUMN = "depth_max"
+DEPTH_MEAN_COLUMN = "depth_mean"
+ROWS_OVER_TOLERANCE_COLUMN = "rows_over_tolerance"
+ROWS_DELETED_COLUMN = "rows_deleted"
 INGEST_COLUMNS = [
     ColumnMetadata(name=INGESTED_ROWS_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=WRITE_OP_RATE_COLUMN, unit="op/s", type=ResultType.INTEGER),
@@ -198,6 +214,10 @@ INGEST_COLUMNS = [
     ColumnMetadata(name=REWRITE_RANGES_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=MERGES_STARTED_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=MERGES_ENDED_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=DEPTH_MAX_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=DEPTH_MEAN_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False),
+    ColumnMetadata(name=ROWS_OVER_TOLERANCE_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=ROWS_DELETED_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
 ]
 # The writer: 'write_rate' rows a second from one loader, for the phase's duration plus
 # WRITER_TAIL_SECS -- it starts with the query phase and has the same start-up to go through, so
@@ -480,6 +500,9 @@ class SubstringIndexSizeResult(StaticGenericResultTable):
             # never needed it.
             ColumnMetadata(name="l0_rows", unit="rows", type=ResultType.INTEGER, higher_is_better=False),
             ColumnMetadata(name="rewrite_ranges", unit="", type=ResultType.INTEGER),
+            # The settled layout's overlap (LAYOUT_GAUGE_METRICS): 1 is disjoint.
+            ColumnMetadata(name=DEPTH_MAX_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+            ColumnMetadata(name=DEPTH_MEAN_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False),
         ]
 
 
@@ -1359,6 +1382,10 @@ class SubstringSearchTest(SearchPerformanceTest):
             "ranges_done": parse_index_gauge(metrics_text, REWRITE_RANGES_DONE_METRIC, keyspace, index_name),
             "merges_started": parse_index_gauge(metrics_text, MERGES_STARTED_METRIC, keyspace, index_name),
             "merges_ended": parse_index_gauge(metrics_text, MERGES_ENDED_METRIC, keyspace, index_name),
+            **{
+                key: parse_index_gauge(metrics_text, metric, keyspace, index_name)
+                for key, metric in LAYOUT_GAUGE_METRICS.items()
+            },
         }
 
     @staticmethod
@@ -1379,6 +1406,14 @@ class SubstringSearchTest(SearchPerformanceTest):
             # .get: a reading from before vector-store exported the merges has no such key.
             if before.get(key) is not None and after.get(key) is not None:
                 cells[column] = int(max(after[key] - before[key], 0))
+        for key, column in (
+            ("depth_max", DEPTH_MAX_COLUMN),
+            ("depth_mean", DEPTH_MEAN_COLUMN),
+            ("rows_over_tolerance", ROWS_OVER_TOLERANCE_COLUMN),
+            ("rows_deleted", ROWS_DELETED_COLUMN),
+        ):
+            if after.get(key) is not None:
+                cells[column] = round(after[key], 2) if column == DEPTH_MEAN_COLUMN else int(after[key])
         return cells
 
     def _diag(self, node) -> _BoundedRemoter:
@@ -1980,6 +2015,14 @@ class SubstringSearchTest(SearchPerformanceTest):
         rewrite_ranges = parse_index_gauge(metrics_text, REWRITE_RANGES_TOTAL_METRIC, keyspace, index_name)
         if l0_rows is not None:
             result_table.add_result(column="l0_rows", row=row_key, value=int(l0_rows), status=Status.UNSET)
+        depth_max = parse_index_gauge(metrics_text, LAYOUT_GAUGE_METRICS["depth_max"], keyspace, index_name)
+        depth_mean = parse_index_gauge(metrics_text, LAYOUT_GAUGE_METRICS["depth_mean"], keyspace, index_name)
+        if depth_max is not None:
+            result_table.add_result(column=DEPTH_MAX_COLUMN, row=row_key, value=int(depth_max), status=Status.UNSET)
+        if depth_mean is not None:
+            result_table.add_result(
+                column=DEPTH_MEAN_COLUMN, row=row_key, value=round(depth_mean, 2), status=Status.UNSET
+            )
         if rewrite_ranges is not None:
             result_table.add_result(
                 column="rewrite_ranges", row=row_key, value=int(rewrite_ranges), status=Status.UNSET

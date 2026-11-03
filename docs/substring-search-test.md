@@ -215,7 +215,14 @@ carries:
   the phase (vector-store's `pattern_merges_*` gauges; Tantivy's own merges after a commit are not
   counted). `started` far ahead of `ended` is a backlog. Run a0e51aa9 (2026-11-02) had one of
   thousands, the same merge queued again every second while it ran, before vector-store's
-  `bdce43f`.
+  `bdce43f`;
+- `depth_max`, `depth_mean`, `rows_over_tolerance` and `rows_deleted`: how far the layout the
+  phase ended with is from disjoint (vector-store's `pattern_layout_*` gauges, from `5e00b7d`).
+  A segment's depth is the most segments covering one sort key within its bounds; 1 is a
+  disjoint layout, which the ordered walk prunes best. `depth_mean` averages it over rows,
+  `rows_over_tolerance` counts the rows in segments deeper than 2, and `rows_deleted` the deleted
+  rows a merge has not dropped yet. The index size table reports `depth_max` and `depth_mean`
+  for the settled index too.
 
 The CPU columns and the thread states cover one window: 20 s from 70 s into the phase, inside
 latte's queries. Each node records its own CPU reading at both ends of the window. A phase that
