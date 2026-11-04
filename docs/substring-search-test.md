@@ -143,7 +143,8 @@ query cost the index, from the delta of the walk totals (`pattern_search_*_total
 `walk_us_per_query`, `prepare_us_per_query` (the part of the walk spent reading segment bounds before
 the first posting) and `column_opens_per_query` (columns opened for it), `page_resolve_us_per_query`
 (the part spent turning the page into primary ids), `segments_considered_per_query`, `segments_opened_per_query`,
-`postings_per_query`, `heap_entrants_per_query` and `store_reads_per_query`. Postings scanned is
+`segments_wasted_per_query` (of those opened, the ones that put no row on the page: the layout's
+overlap where the queries go), `postings_per_query`, `heap_entrants_per_query` and `store_reads_per_query`. Postings scanned is
 the number to read first: an ordered query that scans tens of thousands of postings for a page of
 20 is walking segments it could not skip, and that is a layout problem, not a query one.
 

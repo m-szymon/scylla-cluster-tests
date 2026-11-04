@@ -139,6 +139,9 @@ WALK_PER_QUERY_METRICS = {
     "column_opens_per_query": ("pattern_search_column_opens_total", 1),
     "segments_considered_per_query": ("pattern_search_segments_considered_total", 1),
     "segments_opened_per_query": ("pattern_search_segments_opened_total", 1),
+    # Of those, the ones that put no row on the page: what the layout's overlap costs the queries
+    # (vector-store 20a25f3; absent before it).
+    "segments_wasted_per_query": ("pattern_search_segments_wasted_total", 1),
     "postings_per_query": ("pattern_search_postings_scanned_total", 1),
     "heap_entrants_per_query": ("pattern_search_heap_entrants_total", 1),
     "store_reads_per_query": ("pattern_search_store_reads_total", 1),
