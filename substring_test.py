@@ -1259,10 +1259,23 @@ class SubstringSearchTest(SearchPerformanceTest):
     def search_extra_columns(self):
         return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS + VS_THREADS_COLUMNS + INGEST_COLUMNS
 
+    def _settle_after_writes(self, query: dict):
+        """Before a phase without a writer that follows one with a writer, wait for the queried
+        index to settle: the phase measures the index the writes left, not its repair still going
+        on (run 7a300b9d's last time-order phase ran while the repair moved 484k rows)."""
+        wrote = getattr(self, "_last_phase_wrote", False)
+        self._last_phase_wrote = bool(checked_writer(query))
+        queried = getattr(self, "_queried_index", None)
+        if wrote and not self._last_phase_wrote and queried is not None:
+            keyspace, index_name = queried
+            self.log.info("The last phase wrote; waiting for index '%s' to settle before this one", index_name)
+            self._wait_for_index_settled(keyspace, index_name, timeout=self._max_settle)
+
     def search_phase_begin(self, query: dict):
         # 'all_loaders: true' runs the phase from every loader at once: a second client, to tell a
         # limit of the client from one of the cluster.
         self._fan_out = bool(query.get("all_loaders", False))
+        self._settle_after_writes(query)
         ingest = self._scrape_ingest()
         writer = self._start_writer(query)
         profiles = self._start_profiles(query) if query.get("profile") else []

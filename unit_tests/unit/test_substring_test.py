@@ -939,6 +939,20 @@ def test_an_index_with_a_repair_pending_is_not_settled(monkeypatch):
     assert now[0] >= 7 * substring_test.SETTLE_POLL_INTERVAL_SECS
 
 
+def test_a_phase_after_a_writer_waits_for_the_index_to_settle():
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.log = logging.getLogger("test_substring_test")
+    test._max_settle = 600
+    test._queried_index = ("ks", "idx")
+    waits = []
+    test._wait_for_index_settled = lambda keyspace, index, timeout: waits.append((keyspace, index, timeout))
+    writer = {"set": "char2", "write_rate": 5000}
+    for query in ({"set": "char2"}, writer, writer, {"set": "char2"}, {"set": "char2"}):
+        test._settle_after_writes(query)
+    # Only the phase right after the writer ones waits.
+    assert waits == [("ks", "idx", 600)]
+
+
 def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():
     text = (
         "1793357687.25\n"
