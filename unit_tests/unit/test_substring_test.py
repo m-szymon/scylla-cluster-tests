@@ -861,26 +861,30 @@ def test_every_ingest_quantity_is_a_column():
     before = {
         "lag": _lag((0,) * 5, 0.0),
         "segments": 40.0,
-        "l0": 0.0,
-        "ranges_done": 3.0,
+        "rewrite_steps": 3.0,
+        "rewrite_rows": 300.0,
         "merges_started": 10.0,
         "merges_ended": 9.0,
     }
     after = {
         "lag": _lag((5, 5, 5, 5, 5), 0.1),
         "segments": 41.0,
-        "l0": 1000.0,
-        "ranges_done": 7.0,
+        "rewrite_steps": 7.0,
+        "rewrite_rows": 1000.0,
         "merges_started": 25.0,
         "merges_ended": 21.0,
         "depth_max": 3.0,
         "depth_mean": 1.234,
         "rows_over_tolerance": 500.0,
         "rows_deleted": 7.0,
+        "fresh_rows": 120.0,
+        "fresh_segments": 2.0,
     }
     cells = test._ingest_cells(before, after)
     assert set(cells) | {substring_test.WRITE_OP_RATE_COLUMN} == names
-    assert cells[substring_test.REWRITE_RANGES_COLUMN] == 4
+    assert cells[substring_test.REWRITE_STEPS_COLUMN] == 4
+    assert cells[substring_test.REWRITE_ROWS_COLUMN] == 700
+    assert cells[substring_test.FRESH_ROWS_COLUMN] == 120
     assert cells[substring_test.MERGES_STARTED_COLUMN] == 15
     assert cells[substring_test.MERGES_ENDED_COLUMN] == 12
     assert cells[substring_test.DEPTH_MAX_COLUMN] == 3
@@ -889,7 +893,7 @@ def test_every_ingest_quantity_is_a_column():
 
 
 def test_a_vector_store_without_merge_gauges_leaves_their_cells_empty():
-    before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "l0": 0.0, "ranges_done": 3.0}
+    before = {"lag": _lag((0,) * 5, 0.0), "segments": 40.0, "rewrite_steps": 3.0}
     cells = substring_test.SubstringSearchTest._ingest_cells(before, dict(before))
     assert substring_test.MERGES_STARTED_COLUMN not in cells
     assert substring_test.DEPTH_MAX_COLUMN not in cells
@@ -924,6 +928,15 @@ def test_an_index_with_merges_running_is_not_settled_however_still_its_segment_c
     test._wait_for_index_settled("ks", "idx", timeout=3600)
     # Settled on the polls after the merges stopped, not on the first three still ones.
     assert now[0] >= 8 * substring_test.SETTLE_POLL_INTERVAL_SECS
+
+
+def test_an_index_with_a_repair_pending_is_not_settled(monkeypatch):
+    """A repair moves rows on every idle tick; settled only once nothing is pending."""
+    segments, pending = substring_test.SEGMENT_COUNT_METRIC, substring_test.REWRITE_PENDING_METRIC
+    readings = [{segments: 60, pending: 1}] * 5 + [{segments: 60, pending: 0}] * 4
+    test, now = _settling(monkeypatch, readings)
+    test._wait_for_index_settled("ks", "idx", timeout=3600)
+    assert now[0] >= 7 * substring_test.SETTLE_POLL_INTERVAL_SECS
 
 
 def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():

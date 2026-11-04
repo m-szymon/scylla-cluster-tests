@@ -19,8 +19,8 @@
 # - ingested_rows, index_lag_mean_s, index_lag_p99_s: the changes the queried index took in during
 #   the phase, and how long one took from its write to being searchable;
 # - write_op_rate: what the writer achieved;
-# - segments, l0_rows, rewrite_ranges_done: the layout the phase ended with and the rewrite work
-#   done during it;
+# - segments, rewrite_steps, rewrite_rows, fresh_rows, fresh_segments, depth_*: the layout the
+#   phase ended with and the repair work done during it;
 # - the CPU columns, now over the same 20 s window as the thread states and profiles (70 s into the
 #   phase, inside latte's queries), not the whole phase with its start-up;
 # - walk costs per query, as before. Segments opened per query is what shows a tie-heavy order

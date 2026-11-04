@@ -21,8 +21,8 @@
 # The second dataset is the writer's smoke: a 200k-row table (names_200k_writes is a symlink to
 # names_1M_matrix, loading its first two shards), with phases that write 500 rows a second while
 # they query. Nothing in it is checked for accuracy -- the writes change every answer -- it shows
-# that the writer runs, and that the ingest columns (ingested_rows, index_lag_*, segments, l0_rows,
-# rewrite_ranges_done, write_op_rate) are filled.
+# that the writer runs, and that the ingest columns (ingested_rows, index_lag_*, segments,
+# rewrite_steps, rewrite_rows, fresh_rows, write_op_rate) are filled.
 #
 #   ln -s names_1M_matrix data_dir/latte/substring_search/names_200k_writes
 #   SCT_SEARCH_TEST_CONFIG=data_dir/latte/substring_search/local_orders_config.yaml
