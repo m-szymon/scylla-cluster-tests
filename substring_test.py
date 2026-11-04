@@ -103,11 +103,12 @@ SEGMENT_SORT_MAX_METRIC = "pattern_segment_sort_max"
 # over a query phase, divided by the searches served in it, says what one query cost the index --
 # which is what tells a slow walk from a wide-segment layout when the latency alone cannot.
 SEARCHES_METRIC = "pattern_search_total"
-# P3b progress: an index with the rewrite on is not settled until every range has been moved.
-REWRITE_RANGES_TOTAL_METRIC = "pattern_rewrite_ranges_total"
-REWRITE_RANGES_DONE_METRIC = "pattern_rewrite_ranges_done"
+# The repair of the layout (vector-store 845f904): steps and rows moved since the index was created,
+# and 1 while there are fresh rows, or an ordered stretch past the cap, to repair. An index with the
+# rewrite on is not settled while one is pending.
+REWRITE_STEPS_METRIC = "pattern_rewrite_steps_total"
 REWRITE_DOCS_METRIC = "pattern_rewrite_docs_total"
-L0_DOCS_METRIC = "pattern_l0_docs"
+REWRITE_PENDING_METRIC = "pattern_rewrite_pending"
 # The merges an index's own ticks ask for (Tantivy's merges after a commit are not counted):
 # running totals of started and ended, and how many run now. An index is not settled while one
 # runs; 'started' far ahead of 'ended' is a merge queued again while it still ran (run a0e51aa9).
@@ -123,6 +124,8 @@ LAYOUT_GAUGE_METRICS = {
     "depth_mean": "pattern_layout_depth_mean",
     "rows_over_tolerance": "pattern_layout_rows_over_tolerance",
     "rows_deleted": "pattern_layout_rows_deleted",
+    "fresh_rows": "pattern_layout_fresh_rows",
+    "fresh_segments": "pattern_layout_fresh_segments",
 }
 # Column of the search latency table -> (metric, unit scale applied to the per-query value).
 WALK_PER_QUERY_METRICS = {
@@ -182,12 +185,12 @@ CPU_COLUMNS = [
 # made it searchable -- vector-store's 'indexing_lag_seconds' histogram of the fine CDC reader (the
 # wide one indexes every change again, minutes later), so the p99 is the bound of its bucket, and a
 # p99 past the last bucket (300 s) reads as INDEX_LAG_OVERFLOW_S.
-# 'write_op_rate' is what the writer achieved, 'segments' and 'l0_rows' the layout the phase
-# ended with (rows in wide segments when the last rewrite was planned), and
-# 'rewrite_ranges_done' the rewrite work done during the phase. 'merges_started' and 'merges_ended'
+# 'write_op_rate' is what the writer achieved, 'segments' the layout the phase ended with, and
+# 'rewrite_steps' and 'rewrite_rows' the repair work done during the phase. 'merges_started' and 'merges_ended'
 # are the merges the index's ticks asked for and saw end during the phase (MERGES_*_METRIC).
-# 'depth_max', 'depth_mean', 'rows_over_tolerance' and 'rows_deleted' are the layout's overlap the
-# phase ended with (LAYOUT_GAUGE_METRICS).
+# 'depth_max', 'depth_mean', 'rows_over_tolerance', 'rows_deleted', 'fresh_rows' and
+# 'fresh_segments' are the layout's overlap the phase ended with, and the rows and segments not
+# repaired yet (LAYOUT_GAUGE_METRICS).
 INDEXING_LAG_METRIC = "indexing_lag_seconds"
 INDEXING_LAG_READER = "fine"
 INDEX_LAG_OVERFLOW_S = 600.0
@@ -196,28 +199,32 @@ WRITE_OP_RATE_COLUMN = "write_op_rate"
 INDEX_LAG_MEAN_COLUMN = "index_lag_mean_s"
 INDEX_LAG_P99_COLUMN = "index_lag_p99_s"
 SEGMENTS_COLUMN = "segments"
-L0_ROWS_COLUMN = "l0_rows"
-REWRITE_RANGES_COLUMN = "rewrite_ranges_done"
+REWRITE_STEPS_COLUMN = "rewrite_steps"
+REWRITE_ROWS_COLUMN = "rewrite_rows"
 MERGES_STARTED_COLUMN = "merges_started"
 MERGES_ENDED_COLUMN = "merges_ended"
 DEPTH_MAX_COLUMN = "depth_max"
 DEPTH_MEAN_COLUMN = "depth_mean"
 ROWS_OVER_TOLERANCE_COLUMN = "rows_over_tolerance"
 ROWS_DELETED_COLUMN = "rows_deleted"
+FRESH_ROWS_COLUMN = "fresh_rows"
+FRESH_SEGMENTS_COLUMN = "fresh_segments"
 INGEST_COLUMNS = [
     ColumnMetadata(name=INGESTED_ROWS_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=WRITE_OP_RATE_COLUMN, unit="op/s", type=ResultType.INTEGER),
     ColumnMetadata(name=INDEX_LAG_MEAN_COLUMN, unit="s", type=ResultType.FLOAT, higher_is_better=False),
     ColumnMetadata(name=INDEX_LAG_P99_COLUMN, unit="s", type=ResultType.FLOAT, higher_is_better=False),
     ColumnMetadata(name=SEGMENTS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
-    ColumnMetadata(name=L0_ROWS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
-    ColumnMetadata(name=REWRITE_RANGES_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=REWRITE_STEPS_COLUMN, unit="", type=ResultType.INTEGER),
+    ColumnMetadata(name=REWRITE_ROWS_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=MERGES_STARTED_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=MERGES_ENDED_COLUMN, unit="", type=ResultType.INTEGER),
     ColumnMetadata(name=DEPTH_MAX_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
     ColumnMetadata(name=DEPTH_MEAN_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False),
     ColumnMetadata(name=ROWS_OVER_TOLERANCE_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
     ColumnMetadata(name=ROWS_DELETED_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=FRESH_ROWS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
+    ColumnMetadata(name=FRESH_SEGMENTS_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
 ]
 # The writer: 'write_rate' rows a second from one loader, for the phase's duration plus
 # WRITER_TAIL_SECS -- it starts with the query phase and has the same start-up to go through, so
@@ -495,11 +502,10 @@ class SubstringIndexSizeResult(StaticGenericResultTable):
             # load. The ingestion cost of an index option -- a merge policy that rewrites its tail
             # on every commit, say -- shows up here and nowhere else.
             ColumnMetadata(name="catch_up_secs", unit="s", type=ResultType.FLOAT, higher_is_better=False),
-            # The rewrite of wide segments (P3b): rows it found in wide segments when it planned,
-            # and the ranges it moved them in. Zero for an index without the option, or one that
-            # never needed it.
-            ColumnMetadata(name="l0_rows", unit="rows", type=ResultType.INTEGER, higher_is_better=False),
-            ColumnMetadata(name="rewrite_ranges", unit="", type=ResultType.INTEGER),
+            # The repair of the layout: the steps it took and the rows it moved up to the settle.
+            # Zero for an index without the option, or one that never needed it.
+            ColumnMetadata(name=REWRITE_STEPS_COLUMN, unit="", type=ResultType.INTEGER),
+            ColumnMetadata(name=REWRITE_ROWS_COLUMN, unit="rows", type=ResultType.INTEGER),
             # The settled layout's overlap (LAYOUT_GAUGE_METRICS): 1 is disjoint.
             ColumnMetadata(name=DEPTH_MAX_COLUMN, unit="", type=ResultType.INTEGER, higher_is_better=False),
             ColumnMetadata(name=DEPTH_MEAN_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False),
@@ -1367,7 +1373,7 @@ class SubstringSearchTest(SearchPerformanceTest):
         return {WRITE_OP_RATE_COLUMN: int(sum(rates))}
 
     def _scrape_ingest(self) -> dict | None:
-        """The queried index's lag histogram, segment count, L0 rows and rewrite progress, or None."""
+        """The queried index's lag histogram, segment count, layout and repair progress, or None."""
         queried = getattr(self, "_queried_index", None)
         if queried is None:
             return None
@@ -1378,8 +1384,8 @@ class SubstringSearchTest(SearchPerformanceTest):
         return {
             "lag": parse_indexing_lag(metrics_text, keyspace, index_name),
             "segments": parse_index_gauge(metrics_text, SEGMENT_COUNT_METRIC, keyspace, index_name),
-            "l0": parse_index_gauge(metrics_text, L0_DOCS_METRIC, keyspace, index_name),
-            "ranges_done": parse_index_gauge(metrics_text, REWRITE_RANGES_DONE_METRIC, keyspace, index_name),
+            "rewrite_steps": parse_index_gauge(metrics_text, REWRITE_STEPS_METRIC, keyspace, index_name),
+            "rewrite_rows": parse_index_gauge(metrics_text, REWRITE_DOCS_METRIC, keyspace, index_name),
             "merges_started": parse_index_gauge(metrics_text, MERGES_STARTED_METRIC, keyspace, index_name),
             "merges_ended": parse_index_gauge(metrics_text, MERGES_ENDED_METRIC, keyspace, index_name),
             **{
@@ -1396,10 +1402,9 @@ class SubstringSearchTest(SearchPerformanceTest):
         cells = indexing_lag_cells(before["lag"], after["lag"])
         if after["segments"] is not None:
             cells[SEGMENTS_COLUMN] = int(after["segments"])
-        if after["l0"] is not None:
-            cells[L0_ROWS_COLUMN] = int(after["l0"])
         for key, column in (
-            ("ranges_done", REWRITE_RANGES_COLUMN),
+            ("rewrite_steps", REWRITE_STEPS_COLUMN),
+            ("rewrite_rows", REWRITE_ROWS_COLUMN),
             ("merges_started", MERGES_STARTED_COLUMN),
             ("merges_ended", MERGES_ENDED_COLUMN),
         ):
@@ -1411,6 +1416,8 @@ class SubstringSearchTest(SearchPerformanceTest):
             ("depth_mean", DEPTH_MEAN_COLUMN),
             ("rows_over_tolerance", ROWS_OVER_TOLERANCE_COLUMN),
             ("rows_deleted", ROWS_DELETED_COLUMN),
+            ("fresh_rows", FRESH_ROWS_COLUMN),
+            ("fresh_segments", FRESH_SEGMENTS_COLUMN),
         ):
             if after.get(key) is not None:
                 cells[column] = round(after[key], 2) if column == DEPTH_MEAN_COLUMN else int(after[key])
@@ -1910,20 +1917,19 @@ class SubstringSearchTest(SearchPerformanceTest):
                     "No '%s' sample for '%s'; not waiting for it to settle", SEGMENT_COUNT_METRIC, index_name
                 )
                 return
-            # A rewrite in progress moves a range per tick and changes the layout every time; the
-            # index is settled only once it has finished (and the merges after it have stopped).
-            ranges_total = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_TOTAL_METRIC) or 0
-            ranges_done = self._read_index_gauge(keyspace, index_name, REWRITE_RANGES_DONE_METRIC) or 0
-            rewriting = ranges_done < ranges_total
+            # A repair in progress moves rows on every idle tick and changes the layout every time;
+            # the index is settled only once nothing is pending (and the merges after it have
+            # stopped).
+            rewriting = bool(self._read_index_gauge(keyspace, index_name, REWRITE_PENDING_METRIC))
             # A segment count can hold still while merges run, and run a0e51aa9's did, for ten
             # minutes, with a backlog of thousands; a vector-store without the gauge reads as none.
             merging = self._read_index_gauge(keyspace, index_name, MERGES_RUNNING_METRIC) or 0
             if rewriting:
                 self.log.info(
-                    "Index '%s' rewriting wide segments: %d of %d ranges moved, %d segments, %d merges running",
+                    "Index '%s' repairing its layout: %d steps so far, %d fresh rows, %d segments, %d merges running",
                     index_name,
-                    int(ranges_done),
-                    int(ranges_total),
+                    int(self._read_index_gauge(keyspace, index_name, REWRITE_STEPS_METRIC) or 0),
+                    int(self._read_index_gauge(keyspace, index_name, LAYOUT_GAUGE_METRICS["fresh_rows"]) or 0),
                     int(segments),
                     int(merging),
                 )
@@ -2011,10 +2017,8 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
         if catch_up_secs is not None:
             result_table.add_result(column="catch_up_secs", row=row_key, value=catch_up_secs, status=Status.UNSET)
-        l0_rows = parse_index_gauge(metrics_text, L0_DOCS_METRIC, keyspace, index_name)
-        rewrite_ranges = parse_index_gauge(metrics_text, REWRITE_RANGES_TOTAL_METRIC, keyspace, index_name)
-        if l0_rows is not None:
-            result_table.add_result(column="l0_rows", row=row_key, value=int(l0_rows), status=Status.UNSET)
+        rewrite_steps = parse_index_gauge(metrics_text, REWRITE_STEPS_METRIC, keyspace, index_name)
+        rewrite_rows = parse_index_gauge(metrics_text, REWRITE_DOCS_METRIC, keyspace, index_name)
         depth_max = parse_index_gauge(metrics_text, LAYOUT_GAUGE_METRICS["depth_max"], keyspace, index_name)
         depth_mean = parse_index_gauge(metrics_text, LAYOUT_GAUGE_METRICS["depth_mean"], keyspace, index_name)
         if depth_max is not None:
@@ -2023,16 +2027,19 @@ class SubstringSearchTest(SearchPerformanceTest):
             result_table.add_result(
                 column=DEPTH_MEAN_COLUMN, row=row_key, value=round(depth_mean, 2), status=Status.UNSET
             )
-        if rewrite_ranges is not None:
+        if rewrite_steps is not None and rewrite_rows is not None:
             result_table.add_result(
-                column="rewrite_ranges", row=row_key, value=int(rewrite_ranges), status=Status.UNSET
+                column=REWRITE_STEPS_COLUMN, row=row_key, value=int(rewrite_steps), status=Status.UNSET
             )
-            if rewrite_ranges:
+            result_table.add_result(
+                column=REWRITE_ROWS_COLUMN, row=row_key, value=int(rewrite_rows), status=Status.UNSET
+            )
+            if rewrite_steps:
                 self.log.info(
-                    "Index '%s': %d rows in wide segments were rewritten in %d ranges",
+                    "Index '%s': the repair moved %d rows in %d steps",
                     index_name,
-                    int(l0_rows or 0),
-                    int(rewrite_ranges),
+                    int(rewrite_rows),
+                    int(rewrite_steps),
                 )
         submit_results_to_argus(self.test_config.argus_client(), result_table)
 

@@ -156,8 +156,9 @@ by dropping it so the next round reaches another. The size row (with `catch_up_s
 load each index held every row -- the ingestion cost of its options), the layout and the per-query
 walk columns are reported per variant. Without `index_during_load` the variants are created after the
 load instead, each built by vector-store's full scan: the backfill case, where `catch_up_secs` is the
-build time and the `l0_rows` / `rewrite_ranges` columns say what the rewrite of wide segments found and
-did. The settle wait covers a rewrite in progress; it lasts up to `max_settle_secs` of the dataset
+build time and the `rewrite_steps` / `rewrite_rows` columns say what the repair of the layout did
+(vector-store `845f904`: rows out of sort order are repaired from a fresh tier into an ordered
+one). The settle wait covers a repair in progress (`pattern_rewrite_pending`); it lasts up to `max_settle_secs` of the dataset
 (600 by default), and the log says how long it took, which for the backfill case is the rewrite's
 cost in time. The options are the pattern index's own:
 `segment_rows` caps segment size and switches on the range-aware merge policy (200000 by default
@@ -208,9 +209,8 @@ carries:
   change again, minutes later). So the p99 is a bucket bound, and past the last bucket it reads
   600;
 - `write_op_rate`: what the writer achieved;
-- `segments`, `l0_rows` and `rewrite_ranges_done`: the layout at the end of the phase, and the
-  rewrite work done during it. `l0_rows` is the rows in wide segments when the last rewrite was
-  planned, not a live count;
+- `segments`, `rewrite_steps` and `rewrite_rows`: the segments at the end of the phase, and the
+  repair steps and the rows they moved during it;
 - `merges_started` and `merges_ended`: the merges the index's ticks asked for and saw end during
   the phase (vector-store's `pattern_merges_*` gauges; Tantivy's own merges after a commit are not
   counted). `started` far ahead of `ended` is a backlog. Run a0e51aa9 (2026-11-02) had one of
@@ -222,7 +222,11 @@ carries:
   disjoint layout, which the ordered walk prunes best. `depth_mean` averages it over rows,
   `rows_over_tolerance` counts the rows in segments deeper than 2, and `rows_deleted` the deleted
   rows a merge has not dropped yet. The index size table reports `depth_max` and `depth_mean`
-  for the settled index too.
+  for the settled index too;
+- `fresh_rows` and `fresh_segments`: the rows not yet repaired into the ordered tier at the end
+  of the phase, and the segments holding them. While the index ingests, the repair waits for two
+  caps of fresh rows and then takes at most half of the time, so a phase with a writer ends with
+  some; an idle index has none.
 
 The CPU columns and the thread states cover one window: 20 s from 70 s into the phase, inside
 latte's queries. Each node records its own CPU reading at both ends of the window. A phase that
