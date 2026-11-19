@@ -1,0 +1,46 @@
+# The repair of a pattern index's layout against a load and writers it lags behind, locally.
+#
+# AWS run 7a300b9d loaded 10M rows through CDC into three ordered indexes created before the load:
+# the repair ran while they ingested (264 steps) and they caught up 1027 s after the load instead
+# of 364; under a 5000-row writer it re-added 2-8 times the rows written, and the last phase, with
+# no writer after random writes, ran while the repair still moved 484k rows. This plan has the same
+# shape on 1M rows, to compare vector-store before the CDC-lag gate (20a25f3) with after it
+# (6cba573 or later), each run on the same laptop:
+#
+# - catch-up after the load, and the repair steps it took by then (the settle wait logs them);
+# - rewrite_steps / rewrite_rows during the writer phases against ingested_rows, and the lag;
+# - the phase after the random writes, which now waits for the index to settle first.
+#
+# Default index options: a 200k-row cap, so the repair under writes starts at 400k fresh rows.
+# Run with the vector-store threads capped at 4, as on the AWS node:
+#   PLAN=local_lag_config OUT=lag_local_<label> VS_THREADS=4 memory_local_chain.sh
+datasets:
+  - name: names_1M_matrix
+    index_during_load: true
+    max_index_wait_secs: 3600
+    max_shard_load_secs: 3600
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: tier
+        order: tie
+        options: {}
+      - label: time
+        options: {}
+    defaults:
+      limit: 20
+      concurrency: 2
+      rate: 0
+      duration: 60s
+      expected_p99_read_ms: 1000
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2, variants: [table]}
+          - {set: char2, write_rate: 5000, variants: [table]}
+          - {set: char2, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char2, ordered: true, variants: [time]}
+          - {set: char2, ordered: true, write_rate: 5000, write_values: random, variants: [time]}
+          - {set: char2, ordered: true, variants: [time]}
