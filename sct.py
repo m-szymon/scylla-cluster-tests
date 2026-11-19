@@ -289,6 +289,15 @@ def cli(ctx):
         "trigger-matrix",
         "trigger-matrix-audit",
     ):
+        # A run on the docker backend with local images reads nothing from AWS once the test key is
+        # in ~/.ssh. SCT_SKIP_AWS_LOGIN=1 skips the login and the key's sync for such a run; a step
+        # that does reach for AWS then fails where it does, which says what still needs it.
+        # Popped: SCTConfiguration refuses an SCT_* variable that is not one of its fields.
+        if os.environ.pop("SCT_SKIP_AWS_LOGIN", None) == "1":
+            if not Path("~/.ssh/scylla_test_id_ed25519").expanduser().exists():
+                raise click.UsageError("SCT_SKIP_AWS_LOGIN=1 needs ~/.ssh/scylla_test_id_ed25519 from an earlier logged-in run")
+            click.secho("SCT_SKIP_AWS_LOGIN=1: not logging in to AWS, not syncing the test key", fg="yellow")
+            return
         try_auth_with_okta()
 
         key_store = KeyStore()

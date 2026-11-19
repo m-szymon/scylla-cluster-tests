@@ -6322,7 +6322,8 @@ class BaseScyllaCluster:
             cluster_name=self.name,
             params=self.params,
             test_config=self.test_config,
-            msldap_server_info=KeyStore().get_ldap_ms_ad_credentials(),
+            # Read by the builder only for LDAP authorization, so a run without it needs no key store.
+            msldap_server_info=KeyStore().get_ldap_ms_ad_credentials() if self.params.get("use_ldap_authorization") else {},
             ip_ssh_connections=self.ip_ssh_connections,
         )
         return ScyllaYaml(**cluster_params_builder.model_dump(exclude_unset=True, exclude_none=True))
