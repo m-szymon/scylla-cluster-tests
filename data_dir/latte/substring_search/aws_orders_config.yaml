@@ -6,7 +6,6 @@
 #
 # - no order_by: a plain LIKE in table order (token, then key), pageable. Every row lands at a
 #   random place in that order, whatever order the rows come in;
-# - 'order_by': 'unordered': a plain LIKE with any matching rows, the old behaviour;
 # - 'order_by': 'tier DESC': five values, so most rows tie; the ties come in table order, and the
 #   index's layout splits on (tier, token);
 # - 'order_by': 'register_time': ORDER BY register_time either way.
@@ -26,7 +25,7 @@
 # - walk costs per query, as before. Segments opened per query is what shows a tie-heavy order
 #   pruning or not.
 #
-# Two datasets, because the index node holds three indexes of 10M names (run 4c4b7647 thrashed
+# One dataset of three indexes: the index node holds three indexes of 10M names (run 4c4b7647 thrashed
 # with six) -- and only on more memory than the test case's c8g.xlarge: a pattern index lives in
 # RAM, about 0.3 GB per 1M names, and run fd5928db's 8 GB node froze in the rewrite after the load.
 # Run on r8g.xlarge (the same 4 vCPUs, 32 GB): about 14 GB at the peak of the first round. Each round drops its index when it is done, so the writes pile up on fewer indexes
@@ -36,9 +35,8 @@
 # after its writes, shows how far a settled index's numbers moved.
 #
 #   A: names_10M_matrix, indexes table, tier, time; rounds in that order.
-#   B: names_10M_unordered (a symlink to names_10M_matrix, loaded again), indexes table and
-#      unordered: a plain LIKE goes to the table-order index while it stands, then to the unordered
-#      one -- the same queries against both, in one run.
+#   (Dataset B, a table-order index against an 'unordered' one, went with the unordered index:
+#   postponed, see vector-store docs/dev/pattern/postponed.md.)
 #
 # Profiles (DB node and index node, 20 s from 70 s in): char2 in table order, char8_common in tier
 # order, char2 with random writes in register_time order.
@@ -48,8 +46,7 @@
 #   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config VS_TYPE=r8g.xlarge port_aws_chain.sh
 #
 # Budget: provisioning ~20 min; A: load and ingest of three indexes ~35 min, 21 phases at ~2.3 min
-# ~50 min, 3 profiles ~12 min; B: load and ingest of two ~30 min, 8 phases ~18 min; log collection
-# and teardown ~12 min: about 3:00.
+# ~50 min, 3 profiles ~12 min; log collection and teardown ~12 min: about 2:10.
 datasets:
   - name: names_10M_matrix
     index_during_load: true
@@ -95,28 +92,3 @@ datasets:
           - {set: char2, ordered: true, write_rate: 5000, write_values: random, profile: true, variants: [time]}
           - {set: char8_common, ordered: true, write_rate: 5000, write_values: random, variants: [time]}
           - {set: char2, ordered: true, variants: [time]}
-  - name: names_10M_unordered
-    index_during_load: true
-    max_index_wait_secs: 7200
-    max_shard_load_secs: 7200
-    max_settle_secs: 1800
-    index_variants:
-      - label: table
-        order: table
-        options: {}
-      - label: unordered
-        order: unordered
-        options: {}
-    defaults:
-      limit: 20
-      duration: 60s
-      concurrency: 64
-      rate: 0
-      expected_p99_read_ms: 100
-    steps:
-      - shards: [0..9]
-        queries:
-          - {set: char2}
-          - {set: char8_common}
-          - {set: miss}
-          - {set: char2, write_rate: 5000}

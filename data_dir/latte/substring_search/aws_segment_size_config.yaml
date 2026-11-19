@@ -1,8 +1,8 @@
 # Segment size sweep: how flat is the cost across query shapes as segments grow. Three variants
 # of the capped index ingest the same CDC stream and differ only in the cap (segment_rows, rows a
 # segment). All three run vector-store a7fefd2 (a segment that passes the gram check has its
-# postings built from the entries the check found) and verify on the node
-# (verify_candidates: 'index'), which the 2026-09-29 A/B showed costs no capacity.
+# postings built from the entries the check found) and verify on the node, which the
+# 2026-09-29 A/B showed costs no capacity.
 #   cap_100k  the layout of the 2026-09-29 runs (130-152 segments at 10M)
 #   cap_200k  half the segments
 #   cap_400k  a quarter
@@ -26,11 +26,11 @@ datasets:
     max_shard_load_secs: 7200
     index_variants:
       - label: cap_100k
-        options: {segment_rows: '100000', rewrite: 'false', verify_candidates: 'index'}
+        options: {segment_rows: '100000', rewrite: 'false'}
       - label: cap_200k
-        options: {segment_rows: '200000', rewrite: 'false', verify_candidates: 'index'}
+        options: {segment_rows: '200000', rewrite: 'false'}
       - label: cap_400k
-        options: {segment_rows: '400000', rewrite: 'false', verify_candidates: 'index'}
+        options: {segment_rows: '400000', rewrite: 'false'}
     defaults:
       limit: 20
       duration: 60s

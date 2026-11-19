@@ -79,12 +79,12 @@ const TIE_COLUMN = latte::param!("tie_column", "");
 const TIE_VALUES = latte::param!("tie_values", 5);
 //   index_order  what the index orders by, as a named shape, since an order_by list has spaces a
 //                -P value cannot carry: "" (the default) the order_by column, "table" no
-//                order_by option at all (table order), "unordered" 'order_by': 'unordered', "tie"
+//                order_by option at all (table order), "tie"
 //                the tie column descending.
 const INDEX_ORDER = latte::param!("index_order", "");
 //   extra_option_name / extra_option_value, extra_option2_name / ..., extra_option3_name / ...
 //              up to three more entries for the WITH OPTIONS map, for an option this script has no
-//              opinion about (segment_rows, rewrite, verify_candidates). Plain params rather
+//              opinion about (segment_rows, rewrite). Plain params rather
 //              than a quoted fragment: latte splices a -P value into the script as a literal, so a
 //              quote inside it breaks the parse. ScyllaDB rejects a name it does not know.
 const EXTRA_OPTION_NAME = latte::param!("extra_option_name", "");
@@ -164,8 +164,6 @@ fn index_options_clause() {
     if MAX_GRAM > 0 && !is_extra_option("max_gram") { opts += `'max_gram': '${MAX_GRAM}', `; }
     if INDEX_ORDER == "" {
         if is_ordered() && !is_extra_option("order_by") { opts += `'order_by': '${ORDER_BY}', `; }
-    } else if INDEX_ORDER == "unordered" {
-        opts += `'order_by': 'unordered', `;
     } else if INDEX_ORDER == "tie" {
         opts += `'order_by': '${TIE_COLUMN} DESC', `;
     }
@@ -225,8 +223,8 @@ fn insert_args(user_id, name, sort) {
 
 /// The shape parameters that do not depend on a phase, checked before anything is created.
 fn check_shape() {
-    if INDEX_ORDER != "" && INDEX_ORDER != "table" && INDEX_ORDER != "unordered" && INDEX_ORDER != "tie" {
-        return Err("index_order must be '', 'table', 'unordered' or 'tie'");
+    if INDEX_ORDER != "" && INDEX_ORDER != "table" && INDEX_ORDER != "tie" {
+        return Err("index_order must be '', 'table' or 'tie'");
     }
     if has_tie() && !is_ordered() {
         return Err("tie_column is derived from the sort value, so it needs order_by");
@@ -379,7 +377,15 @@ pub async fn prepare(db) {
         db.data.index_build_start = latte::now_timestamp();
         db.data.index_ready = false;
         db.data.index_ready_elapsed = 0.0;
-        db.prepare(PROBE, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern LIMIT 1`).await?;
+        // The probe has to be a query the index being built serves: one ordered by columns takes
+        // only a LIKE ordered by them, one in table order only a LIKE without ORDER BY.
+        let probe_order = "";
+        if INDEX_ORDER == "tie" {
+            probe_order = ` ORDER BY ${TIE_COLUMN} DESC`;
+        } else if INDEX_ORDER == "" && is_ordered() && !is_extra_option("order_by") {
+            probe_order = ` ORDER BY ${ORDER_BY} DESC`;
+        }
+        db.prepare(PROBE, `SELECT user_id FROM ${KEYSPACE}.${TABLE} WHERE ${TARGET_COLUMN} LIKE :pattern${probe_order} LIMIT 1`).await?;
         db.declare_metric("index_ready_seconds", "lower");
         if NAME_COUNT > 0 {
             db.declare_metric("indexing_throughput_names_per_sec", "higher");

@@ -28,6 +28,7 @@ datasets:
       - shards: [0]
         queries:
           - set: char2
+            ordered: true
             concurrency: 1
             rate: 50
       # Shard range: exercises _parse_shard_spec, cumulative name counts and the _drop_index of the
@@ -37,14 +38,19 @@ datasets:
           # The hot case: one character carried by a large share of the names, so the index stops
           # at LIMIT instead of collecting every match.
           - set: char1
+            ordered: true
           - set: char2
+            ordered: true
           # Longer than the default max_gram of 3, so the index intersects three-character grams and
           # verifies each candidate. 'qrels: true' checks the answer is still exactly right.
           - set: char4
+            ordered: true
             qrels: true
           - set: latin
+            ordered: true
           # An answer with no rows in it.
           - set: miss
+            ordered: true
             qrels: true
       # A rebuild on the same corpus: an empty 'shards' list makes _load_step_shards a no-op, so
       # this step is only an index build.
@@ -78,11 +84,14 @@ datasets:
       - shards: [0..2]
         queries:
           - set: char2
+            ordered: true
           # Ground truth over the whole corpus, which this single step has loaded in full, so
           # recall is meaningful: it says the incremental path indexed everything, not just most.
           - set: char4
+            ordered: true
             qrels: true
           - set: miss
+            ordered: true
             qrels: true
           # The three shapes of the same set, so the smoke run covers each once. They are separate
           # rows rather than one: an ordered answer and a plain one are different questions.
@@ -101,6 +110,7 @@ datasets:
           # A window with no ORDER BY: the range is pushed down either way, which is worth covering
           # because it is a different restriction path from the ordered one.
           - set: char2
+            ordered: true
             window: 0.5
           # Keywords past max_gram, up to the 32-character limit (the local corpora are generated
           # with --long-names). Each matches few names; qrels on the two longest keep the
@@ -125,6 +135,7 @@ datasets:
           # A prefix and a suffix are containment with the value's edge marked; the ordered
           # suffix shape checks the anchored walk pages too.
           - set: char2
+            ordered: true
             match: prefix
           - set: char2
             match: suffix

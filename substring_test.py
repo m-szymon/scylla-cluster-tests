@@ -95,7 +95,7 @@ SUBSTRING_BUILD_COUNT_COLUMN = "name_count"
 INDEX_SIZE_METRIC = "pattern_index_size_bytes"
 SEGMENT_COUNT_METRIC = "pattern_segment_count"
 # One sample per segment, labelled 'segment' with the segment's ordinal. The bounds are the sort
-# column's values (vector-store undoes the sort-key bias on export), or absent for an unordered index.
+# column's values (vector-store undoes the sort-key bias on export).
 SEGMENT_DOCS_METRIC = "pattern_segment_docs"
 SEGMENT_SORT_MIN_METRIC = "pattern_segment_sort_min"
 SEGMENT_SORT_MAX_METRIC = "pattern_segment_sort_max"
@@ -240,9 +240,9 @@ WRITER_CONCURRENCY = 64
 WRITER_NAMES_FILE = "writer_names.tsv"
 WRITER_NAMES_ROWS = 100_000
 # An index variant's 'order': what the index orders by, as substring.rn's named shapes -- absent,
-# the test case's 'order_by' column; 'table', no order_by (table order); 'unordered'; 'tie', the
+# the test case's 'order_by' column; 'table', no order_by (table order); 'tie', the
 # 'tie_column' descending.
-VARIANT_ORDERS = ("table", "unordered", "tie")
+VARIANT_ORDERS = ("table", "tie")
 # How many of the index node's runtime threads were running, on average over a window of the
 # phase, sampled from /proc: tells a node whose workers are all busy from one waiting on something.
 VS_WORKERS_COLUMN = "vs_workers_running"
@@ -656,7 +656,7 @@ def parse_segment_layout(
 ) -> list[tuple[int, float, float | None, float | None]]:
     """The index's segments as (ordinal, live rows, sort min, sort max), by ordinal.
 
-    The bounds are None for an unordered index, which exports none.
+    The bounds are None for a segment that exports none.
     """
     docs = parse_index_gauge_series(metrics_text, SEGMENT_DOCS_METRIC, keyspace, index_name, "segment")
     lows = parse_index_gauge_series(metrics_text, SEGMENT_SORT_MIN_METRIC, keyspace, index_name, "segment")
@@ -667,7 +667,7 @@ def parse_segment_layout(
 def segment_spans_pct(segments: list[tuple[int, float, float | None, float | None]]) -> list[float]:
     """Each segment's span of the sort column as a percentage of the range every segment covers together.
 
-    A one-value range, or an unordered index, makes every span 0: there is nothing to prune by and
+    A one-value range, or segments without bounds, make every span 0: there is nothing to prune by and
     nothing the pruning could gain, which is the same thing from the query's point of view.
     """
     bounded = [(low, high) for _, _, low, high in segments if low is not None and high is not None]

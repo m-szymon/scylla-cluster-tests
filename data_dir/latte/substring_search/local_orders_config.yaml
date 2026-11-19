@@ -5,8 +5,6 @@
 #
 # - an index with no order_by answers a plain LIKE in table order (token, then key): '<set>_table',
 #   with the order checked ('check_order');
-# - an index with 'order_by': 'unordered' answers it with any matching rows: checked as a set, for
-#   the sets whose matches fit in a page;
 # - an index with 'order_by': 'tier DESC' -- five values, so most rows tie -- answers ORDER BY tier
 #   DESC with the ties in table order: '<set>_tier';
 # - the register_time index answers ORDER BY register_time ASC: '<set>_asc'.
@@ -15,8 +13,7 @@
 #   python3 data_dir/latte/substring_search/derive_order_qrels.py --dataset names_1M_matrix
 #
 # Each query names the variant it is for ('variants'). The rounds go in the variants' order, and
-# each round's first query has to reach its variant: a plain LIKE goes to the table-order index
-# while it stands, and to the unordered one once it is dropped.
+# each round's first query has to reach its variant.
 #
 # The second dataset is the writer's smoke: a 200k-row table (names_200k_writes is a symlink to
 # names_1M_matrix, loading its first two shards), with phases that write 500 rows a second while
@@ -35,9 +32,6 @@ datasets:
     index_variants:
       - label: table
         order: table
-        options: {segment_rows: '20000'}
-      - label: unordered
-        order: unordered
         options: {segment_rows: '20000'}
       - label: tier
         order: tie
@@ -65,14 +59,6 @@ datasets:
           - {set: char4_rare_table, qrels: true, check_order: true, variants: [table]}
           - {set: char8_common_table, qrels: true, check_order: true, variants: [table]}
           - {set: char12_common_table, qrels: true, check_order: true, variants: [table]}
-          - {set: char8_table, qrels: true, variants: [unordered]}
-          - {set: char16_table, qrels: true, variants: [unordered]}
-          - {set: char32_table, qrels: true, variants: [unordered]}
-          - {set: miss_table, qrels: true, variants: [unordered]}
-          - {set: char1_rare_table, qrels: true, variants: [unordered]}
-          - {set: char2_rare_table, qrels: true, variants: [unordered]}
-          - {set: char4_rare_table, qrels: true, variants: [unordered]}
-          - {set: char12_common_table, qrels: true, variants: [unordered]}
           - {set: char1_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
           - {set: char2_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
           - {set: char4_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
