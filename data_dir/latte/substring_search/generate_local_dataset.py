@@ -167,8 +167,9 @@ def _substring_counts(names: list[tuple[str, str, int]], length: int, sample: in
     """How many of the (sampled) names contain each substring of the given length."""
     counts: Counter = Counter()
     for _, name, _sort_value in names[:sample]:
-        seen = {name[i : i + length] for i in range(len(name) - length + 1)}
-        counts.update(seen)
+        # Each substring once per name, in the name's order: a set's order changes from run to run
+        # with string hashing, and with it the order of keywords of equal count.
+        counts.update(dict.fromkeys((name[i : i + length] for i in range(len(name) - length + 1)), 1))
     return counts
 
 
