@@ -103,7 +103,7 @@ datasets:
             # From every loader at once, which locally is the one.
             all_loaders: true
           # A later page, expressed as the query a cursor halfway down the order would produce.
-          # No qrels: ground truth covers the whole corpus and cannot describe a windowed answer.
+          # No qrels: the ground truth is the first page of the order, not a page from its middle.
           - set: char2
             ordered: true
             window: 0.5

@@ -20,8 +20,10 @@ File formats consumed by ``substring.rn``:
 * ``shards/names_NNN.tsv`` -- ``user_id<TAB>nickname<TAB>register_time``
 * ``names.tsv``            -- same, for the non-sharded path
 * ``queries_<set>.tsv``    -- ``query_id<TAB>keyword`` (a bare keyword; the script wraps it in %%)
-* ``qrels_<set>.tsv``      -- ``query_id<TAB>user_id<TAB>grade``, grade 1 for every row that
-                              contains the keyword
+* ``qrels_<set>.tsv``      -- ``query_id<TAB>user_id<TAB>grade``: the expected page of an ordered
+                              query, the ``--limit`` rows that contain the keyword (case-sensitive,
+                              as the index matches) with the highest ``register_time``, highest
+                              first, all graded 1
 
 The names imitate the workload this index was built for: a live-streaming site whose display names
 are mostly 2 to 6 CJK characters, with a minority carrying Latin letters or digits. What matters for
@@ -59,9 +61,11 @@ The value is the row's position in the corpus either way, so the two orders inde
 set of values and differ only in which rows carry which -- the comparison is about layout, not about
 data.
 
-Ground truth (``qrels_*.tsv``) is written only for query sets whose every keyword matches at most
-``--qrels-cap`` names, since recall against a limit of 20 is meaningless once the answer is larger
-than the limit. In practice that means the ``char4``, ``latin`` and ``miss`` sets of a small corpus;
+Ground truth (``qrels_*.tsv``) is the page ``ORDER BY register_time DESC LIMIT n`` must return, in
+that order, so that recall is 1.0 for a right answer even when more names than the limit match, and
+the order check of ``substring.rn`` compares the returned page with it row by row. It is written
+only for query sets whose every keyword matches at most ``--qrels-cap`` names, which keeps the scan
+cheap; in practice that means the ``char4``, ``latin`` and ``miss`` sets of a small corpus.
 ``--qrels-cap 0`` turns ground truth off entirely, which is what the large corpora use.
 """
 
@@ -204,16 +208,17 @@ def _latin_keywords(counts: Counter, wanted: int) -> list[str]:
     return picked[:wanted]
 
 
-def _exact_matches(names: list[tuple[str, str, int]], keyword: str, cap: int) -> list[str] | None:
-    """Every id whose name contains the keyword, or None once there are more than `cap` of them."""
-    folded = keyword.lower()
+def _expected_page(names: list[tuple[str, str, int]], keyword: str, cap: int, limit: int) -> list[str] | None:
+    """The ids of the first page of an ordered query, highest sort value first: the `limit` names
+    that contain the keyword with the highest sort values. None once more than `cap` names match.
+    """
     hits = []
-    for user_id, name, _sort_value in names:
-        if folded in name.lower():
-            hits.append(user_id)
+    for user_id, name, sort_value in names:
+        if keyword in name:
+            hits.append((sort_value, user_id))
             if len(hits) > cap:
                 return None
-    return hits
+    return [user_id for _, user_id in sorted(hits, reverse=True)[:limit]]
 
 
 def generate(
@@ -225,6 +230,7 @@ def generate(
     qrels_cap: int,
     sort_order: str,
     long_names: bool = False,
+    limit: int = 20,
 ) -> None:
     ds_dir = os.path.join(out_root, dataset)
     print(f"generating {names_count} names into {ds_dir} ({shards} shard(s)), sort order {sort_order}")
@@ -279,7 +285,7 @@ def generate(
         rows = []
         capped = False
         for i, kw in enumerate(keywords):
-            hits = _exact_matches(names, kw, qrels_cap)
+            hits = _expected_page(names, kw, qrels_cap, limit)
             if hits is None:
                 capped = True
                 break
@@ -309,6 +315,9 @@ def main() -> None:
         help="skip ground truth for a query set whose keyword matches more names than this; 0 disables it (default: 50)",
     )
     parser.add_argument(
+        "--limit", type=int, default=20, help="the LIMIT whose expected page the ground truth is (default: 20)"
+    )
+    parser.add_argument(
         "--long-names",
         action="store_true",
         help="give a tenth of the names 11 to 32 characters and write the char8/char16/char32 query sets",
@@ -322,7 +331,15 @@ def main() -> None:
     )
     args = parser.parse_args()
     generate(
-        args.dataset, args.names, args.shards, args.out, args.seed, args.qrels_cap, args.sort_order, args.long_names
+        args.dataset,
+        args.names,
+        args.shards,
+        args.out,
+        args.seed,
+        args.qrels_cap,
+        args.sort_order,
+        args.long_names,
+        args.limit,
     )
 
 
