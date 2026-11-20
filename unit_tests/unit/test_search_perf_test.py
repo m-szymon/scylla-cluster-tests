@@ -1067,6 +1067,7 @@ class _PlanTester:
         self.ran.append(dataset["name"])
 
     validate_dataset = search_perf_test.SearchPerformanceTest.validate_dataset
+    extra_search_params = search_perf_test.SearchPerformanceTest.extra_search_params
 
 
 def _run_plan(tmp_path, plan, **kwargs):
@@ -1426,6 +1427,11 @@ class _StepTester(_ResultsTester):
 
     def _record_search(self, **fields):
         search_perf_test.SearchPerformanceTest._record_search(self, **fields)
+
+    extra_search_params = search_perf_test.SearchPerformanceTest.extra_search_params
+    query_shape_label = search_perf_test.SearchPerformanceTest.query_shape_label
+    search_phase_begin = search_perf_test.SearchPerformanceTest.search_phase_begin
+    search_phase_end = search_perf_test.SearchPerformanceTest.search_phase_end
 
 
 def test_every_query_of_a_step_is_recorded_in_order(tmp_path):

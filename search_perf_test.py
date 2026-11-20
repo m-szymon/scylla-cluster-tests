@@ -819,8 +819,11 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         search_duration,
         qrels_file=None,
         ignore_parse_errors=False,
+        extra_params="",
     ) -> dict:
         """Run a single search configuration and return its latency summary.
+
+        `extra_params` are the workload's own '-P name=value ' flags, see 'extra_search_params'.
 
         `stress_options` are latte flags, see '_stress_options'. Passing `qrels_file` turns on the relevance (accuracy) metrics of the rune script. The
         summary is what 'get_hdrhistogram' builds from latte's HDR output for the search function's
@@ -864,6 +867,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                     f"{qrels_param}"
                     f"-P {params.compute_accuracy}={'true' if qrels_file else 'false'} "
                     f"-P {params.search_limit}={limit} "
+                    f"{extra_params}"
                     f"{rate_param}{stress_options} --retry-number 1 "
                     f"{workload.script} "
                 ),
@@ -915,6 +919,13 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         for dataset in datasets:
             _has_invalid_queries(dataset)
         validate_plan_tracks(datasets)
+        # The workload's own keys, checked here for the same reason the shared ones are: a typo
+        # should cost a second, not the half hour it takes to load and index a corpus.
+        for dataset in datasets:
+            self.validate_dataset(dataset)
+            for step in dataset.get("steps") or []:
+                for query in step.get("queries") or []:
+                    self.extra_search_params(query, 0)
         # Query latency comes from latte's HDR output, which is only written with 'use_hdrhistogram'.
         if not self.params.get("use_hdrhistogram") and any(
             step.get("queries") for dataset in datasets for step in dataset.get("steps") or []
@@ -1018,6 +1029,46 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         if index_name is not None:
             self._drop_index(index_name, keyspace, max_index_wait)
 
+    def validate_dataset(self, dataset: dict) -> None:
+        """Reject a dataset entry the workload cannot run, before anything is loaded.
+
+        For checks that need the whole dataset rather than one query entry; the base flow has none.
+        """
+
+    def extra_search_params(self, query: dict, record_count: int) -> str:
+        """Workload-specific '-P name=value ' flags for a query entry, or "".
+
+        Must end with a trailing space when non-empty: it is concatenated into the latte command.
+        Called during plan validation too, with a record count of 0, so it is also where a
+        workload rejects a query key it cannot honour.
+        """
+        return ""
+
+    def query_shape_label(self, query: dict) -> str:
+        """A short name of the shape of question a query entry asks, or "" for the only one.
+
+        Overridden by a workload whose plan can ask one query set in more than one way. Recorded
+        as 'shape' with the entry's results, as it decides what the latency means.
+        """
+        return ""
+
+    def search_phase_begin(self, query: dict):
+        """Called just before a query phase's latte run; whatever it returns reaches 'search_phase_end'.
+
+        *query* is the plan's entry for the phase, so a workload can act on keys of its own. The
+        base flow measures nothing here. A workload uses the pair to bracket the phase with
+        something read off the cluster -- a counter before and after.
+        """
+        return None
+
+    def search_phase_end(self, phase) -> dict:
+        """Called right after the phase's latte run, with what 'search_phase_begin' returned.
+
+        Returns {field: value} to record with the phase's results. A measurement that could not
+        be taken is left out.
+        """
+        return {}
+
     def _run_step_queries(
         self,
         step,
@@ -1047,6 +1098,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                         f"Query set {qset!r} of step #{step_number} needs {needed!r}, which is not in {local_ds_dir}"
                     )
 
+            phase = self.search_phase_begin(query)
             latency = self._run_search(
                 local_ds_dir,
                 container_ds_dir,
@@ -1057,7 +1109,10 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                 search_duration=search_duration,
                 qrels_file=qrels_file,
                 ignore_parse_errors=ignore_parse_errors,
+                extra_params=self.extra_search_params(query, record_count),
             )
+            measured = self.search_phase_end(phase)
+            shape = self.query_shape_label(query)
             if not latency:
                 self.log.warning("No HDR latency summary for query set %s of step #%d", qset, step_number)
             self._record_search(
@@ -1076,6 +1131,8 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                 expected_p99_read_ms=expected_p99_read_ms,
                 latency=latency,
                 **({"track": track, "label": label} if track else {}),
+                **({"shape": shape} if shape else {}),
+                **measured,
             )
 
     def _download_dataset_files(self, bucket, prefix, local_dir, dataset):

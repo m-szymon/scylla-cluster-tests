@@ -39,8 +39,8 @@ import threading
 import time
 
 import requests
-from argus.client.generic_result import ColumnMetadata, ResultType, StaticGenericResultTable, Status
 
+from argus.client.generic_result import ColumnMetadata, ResultType, StaticGenericResultTable, Status
 from sdcm.argus_results import submit_results_to_argus
 from search_perf_test import (
     DEFAULT_MAX_INDEX_WAIT,
@@ -52,9 +52,10 @@ from search_perf_test import (
     _query_duration,
     _timeout_minutes,
 )
-from sdcm.utils.vector_store_index import index_build_columns
 
 SUBSTRING_BASE_DIR = "data_dir/latte/substring_search"
+# Longer than the index node's gauge refresh: an interval of 1 s and up to 1 s for one index.
+GAUGE_REFRESH_WAIT_SECS = 2.5
 
 
 def _checked_direction(value) -> str:
@@ -66,7 +67,8 @@ def _checked_direction(value) -> str:
 
 def _checked_match(value) -> str:
     """The plan's 'match' key: where the keyword has to occur, 'contains' (the default), 'prefix'
-    or 'suffix'."""
+    or 'suffix'.
+    """
     if value not in ("contains", "prefix", "suffix"):
         raise ValueError(f"'match' must be 'contains', 'prefix' or 'suffix', got {value!r}")
     return value
@@ -471,13 +473,6 @@ class _BoundedRemoter:
         return bounded
 
 
-class SubstringIndexBuildResult(StaticGenericResultTable):
-    class Meta:
-        name = "Substring Index Build Time"
-        description = "Substring search index build time and throughput"
-        Columns = index_build_columns(SUBSTRING_BUILD_COUNT_COLUMN, "names")
-
-
 class SubstringIndexSizeResult(StaticGenericResultTable):
     """How much the index costs, per build.
 
@@ -523,10 +518,7 @@ SUBSTRING_WORKLOAD = SearchWorkload(
     item_noun="names",
     index_prefix="sub_idx",
     default_keyspace="substring_bench",
-    remote_root="/tmp/substring",
-    latency_legend="Substring search (LIKE '%keyword%') query latency.",
-    build_result_table=SubstringIndexBuildResult,
-    build_count_column=SUBSTRING_BUILD_COUNT_COLUMN,
+    container_root="/tmp/substring",
     # The names substring.rn uses. It mirrors the vocabulary of fts.rn where the flow is shared and
     # renames the rest to what this workload indexes -- names rather than documents.
     params=LatteScriptParams(
@@ -546,6 +538,9 @@ SUBSTRING_WORKLOAD = SearchWorkload(
     step_records_file_key="names_file",
     default_records_file="names.tsv",
     default_shard_suffix="names_{:03d}.tsv",
+    description="Substring search (LIKE)",
+    table_prefix="Substring",
+    record_label="name count",
 )
 
 
@@ -573,7 +568,8 @@ def parse_index_gauge(
 
 def _has_labels(labels: dict, wanted: dict | None) -> bool:
     """Whether a sample carries each wanted label value -- or no such label at all, as a series of
-    an older vector-store that did not split it."""
+    an older vector-store that did not split it.
+    """
     return all(labels.get(name, value) == value for name, value in (wanted or {}).items())
 
 
@@ -1036,7 +1032,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             self.log.info("Dataset '%s': indexing during load; no build time will be measured", self._dataset_name)
         return super()._run_dataset(dataset)
 
-    def _load_shard(self, local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait):
+    def _load_shard(self, local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait, loader=None):
         """Load a shard, keeping the first one's first names for the writers of the query phases.
 
         Taken here because a shard fetched from S3 is deleted once it is loaded.
@@ -1047,7 +1043,7 @@ class SubstringSearchTest(SearchPerformanceTest):
                 lines = [line for _, line in zip(range(WRITER_NAMES_ROWS), source)]
             with open(writer_names, "w", encoding="utf-8") as names:
                 names.writelines(lines)
-        return super()._load_shard(local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait)
+        return super()._load_shard(local_ds_dir, remote_ds_dir, shard_file, shard_count, max_load_wait, loader=loader)
 
     def _load_step_shards(self, step, bucket, prefix, local_ds_dir, remote_ds_dir, max_load_wait):
         """Create the index before the step's rows are loaded, when indexing during load."""
@@ -1133,7 +1129,17 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._queried_index = None if self._live_variants else (keyspace, index_name)
         return build_seconds
 
-    def _run_step_queries(self, step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir):
+    def _run_step_queries(
+        self,
+        step,
+        dataset_name,
+        defaults,
+        record_count,
+        step_number,
+        local_ds_dir,
+        remote_ds_dir,
+        ignore_parse_errors=False,
+    ):
         """Run the step's query sets once per index variant, or once as usual without variants.
 
         Without 'variants' on any query, each round runs every query against whichever index
@@ -1153,7 +1159,14 @@ class SubstringSearchTest(SearchPerformanceTest):
         self._write_next = max(getattr(self, "_write_next", 0), record_count)
         if not self._live_variants:
             return super()._run_step_queries(
-                step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
+                step,
+                dataset_name,
+                defaults,
+                record_count,
+                step_number,
+                local_ds_dir,
+                remote_ds_dir,
+                ignore_parse_errors=ignore_parse_errors,
             )
         keyspace = self._keyspace()
         filtered = any("variants" in query for query in step.get("queries", []))
@@ -1189,7 +1202,14 @@ class SubstringSearchTest(SearchPerformanceTest):
             )
             try:
                 super()._run_step_queries(
-                    round_step, dataset_name, defaults, record_count, step_number, local_ds_dir, remote_ds_dir
+                    round_step,
+                    dataset_name,
+                    defaults,
+                    record_count,
+                    step_number,
+                    local_ds_dir,
+                    remote_ds_dir,
+                    ignore_parse_errors=ignore_parse_errors,
                 )
             finally:
                 self._variant_label = ""
@@ -1236,6 +1256,7 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _scrape_search_totals(self, keyspace, index_names) -> dict[str, float]:
         """'pattern_search_total' per index, for the ones that export it."""
+        self._wait_for_gauge_refresh()
         metrics_text = self._vs_metrics()
         totals = {}
         for name in index_names:
@@ -1256,13 +1277,11 @@ class SubstringSearchTest(SearchPerformanceTest):
             return
         super()._drop_index(index_name, keyspace, max_index_wait)
 
-    def search_extra_columns(self):
-        return super().search_extra_columns() + WALK_COLUMNS + CPU_COLUMNS + VS_THREADS_COLUMNS + INGEST_COLUMNS
-
     def _settle_after_writes(self, query: dict):
         """Before a phase without a writer that follows one with a writer, wait for the queried
         index to settle: the phase measures the index the writes left, not its repair still going
-        on (run 7a300b9d's last time-order phase ran while the repair moved 484k rows)."""
+        on (run 7a300b9d's last time-order phase ran while the repair moved 484k rows).
+        """
         wrote = getattr(self, "_last_phase_wrote", False)
         self._last_phase_wrote = bool(checked_writer(query))
         queried = getattr(self, "_queried_index", None)
@@ -1276,6 +1295,7 @@ class SubstringSearchTest(SearchPerformanceTest):
         # limit of the client from one of the cluster.
         self._fan_out = bool(query.get("all_loaders", False))
         self._settle_after_writes(query)
+        self._wait_for_gauge_refresh()
         ingest = self._scrape_ingest()
         writer = self._start_writer(query)
         profiles = self._start_profiles(query) if query.get("profile") else []
@@ -1302,9 +1322,11 @@ class SubstringSearchTest(SearchPerformanceTest):
         delta against nothing.
         """
         self._fan_out = False
-        walk_after = self._scrape_walk_totals()
+        # The CPU first, so that the wait for the index's gauges is not in its window.
         cpu_after = self._scrape_cpu()
         window = self._collect_cpu_window(phase["cpu_window"])
+        self._wait_for_gauge_refresh()
+        walk_after = self._scrape_walk_totals()
         if window:
             cpu = cpu_busy_pct(*window)
             span = window[1]["time"] - window[0]["time"]
@@ -1368,7 +1390,8 @@ class SubstringSearchTest(SearchPerformanceTest):
                 rf"-P write_prefix=\"{prefix}\" -P write_base={base} "
                 rf"-P write_values=\"{values}\" -P write_sort_range={max(context['record_count'], 1)} "
             ),
-            duration=_timeout_minutes(seconds + DEFAULT_SCHEMA_TIMEOUT),
+            # No 'duration': 'run_latte_thread' would write it over the command's own '--duration'.
+            # Without one the thread's timeout is the command's duration and 15 minutes.
             extra_files_to_stage=[(local_names, remote_names)],
             round_robin=True,
         )
@@ -1656,7 +1679,8 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _start_profile(self, node, name: str) -> bool:
         """Start PROFILE_SCRIPT on the node in the background: a system-wide recording once the
-        node is busy."""
+        node is busy.
+        """
         script = base64.b64encode(PROFILE_SCRIPT.encode()).decode()
         try:
             self._diag(node).run(f"echo {script} | base64 -d > /tmp/profile.sh", verbose=False, timeout=30)
@@ -1715,6 +1739,15 @@ class SubstringSearchTest(SearchPerformanceTest):
             if value is not None:
                 reading[key] = value
         return reading
+
+    def _wait_for_gauge_refresh(self):
+        """Wait until the index node's gauges show what its indexes have done up to now.
+
+        The node refreshes the gauges of the indexes that changed once a second, in the background,
+        and '/metrics' serves what the last refresh left. A scrape right after a query phase would
+        miss the searches of its last second.
+        """
+        time.sleep(GAUGE_REFRESH_WAIT_SECS)
 
     def _scrape_walk_totals(self) -> dict[str, float] | None:
         """The index's search totals now, or None if there is no index or the scrape failed."""
@@ -1778,7 +1811,8 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _note_vs_answer(self, answered: bool):
         """Track how long the index node has answered nothing; past VS_UNRESPONSIVE_ABORT_SECS of
-        silence, raise VectorStoreUnresponsive rather than poll a dead node until a deadline."""
+        silence, raise VectorStoreUnresponsive rather than poll a dead node until a deadline.
+        """
         now = time.monotonic()
         if answered:
             self._vs_silent_since = None
@@ -1803,7 +1837,8 @@ class SubstringSearchTest(SearchPerformanceTest):
 
     def _try_vs_metrics(self, index_name: str | None = None) -> str | None:
         """'_vs_metrics', or None after a warning: a missed scrape must not end the run, unless the
-        node has gone silent for good (VectorStoreUnresponsive)."""
+        node has gone silent for good (VectorStoreUnresponsive).
+        """
         try:
             return self._vs_metrics()
         except VectorStoreUnresponsive:

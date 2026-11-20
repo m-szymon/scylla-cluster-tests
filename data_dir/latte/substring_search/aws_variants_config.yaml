@@ -37,32 +37,32 @@ datasets:
     defaults:
       limit: 20
       duration: 120s
-      concurrency: 32
+      stress_options: {concurrency: 32}
       rate: 0
       expected_p99_read_ms: 100
     steps:
       - shards: [0..99]
         queries:
           - set: char2
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char2
-            concurrency: 128
+            stress_options: {concurrency: 128}
           - set: char2
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char2
             ordered: true
             window: 0.5
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char1
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char4
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
 
   # --- backfill (stage 3) ----------------------------------------------------------------------
@@ -87,21 +87,21 @@ datasets:
     defaults:
       limit: 20
       duration: 120s
-      concurrency: 32
+      stress_options: {concurrency: 32}
       rate: 0
       expected_p99_read_ms: 100
     steps:
       - shards: [0..99]
         queries:
           - set: char2
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char2
             ordered: true
             window: 0.5
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char1
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000

@@ -19,7 +19,7 @@ datasets:
     max_index_wait_secs: 300
     defaults:
       limit: 20
-      concurrency: 2
+      stress_options: {concurrency: 2}
       rate: 0
       duration: 10s
       expected_p99_read_ms: 100
@@ -29,7 +29,7 @@ datasets:
         queries:
           - set: char2
             ordered: true
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
       # Shard range: exercises _parse_shard_spec, cumulative name counts and the _drop_index of the
       # previous step's index.
@@ -76,7 +76,7 @@ datasets:
     max_index_wait_secs: 300
     defaults:
       limit: 20
-      concurrency: 2
+      stress_options: {concurrency: 2}
       rate: 0
       duration: 10s
       expected_p99_read_ms: 100
@@ -160,7 +160,7 @@ datasets:
     max_index_wait_secs: 300
     defaults:
       limit: 20
-      concurrency: 2
+      stress_options: {concurrency: 2}
       rate: 0
       duration: 10s
       expected_p99_read_ms: 100

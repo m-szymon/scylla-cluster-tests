@@ -24,7 +24,7 @@ datasets:
         options: {}
     defaults:
       limit: 20
-      concurrency: 2
+      stress_options: {concurrency: 2}
       rate: 0
       duration: 20s
       expected_p99_read_ms: 1000

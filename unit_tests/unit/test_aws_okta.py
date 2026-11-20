@@ -42,7 +42,8 @@ def test_a_login_that_is_not_valid_is_reported_rather_than_raised(error):
     """This is the question 'do I need to log in again' -- so every way of not being logged in has
     to answer it with False. An expired token is the commonest of them, and STS reports it as a
     ClientError rather than by failing to find credentials, so before it was handled the one case
-    the Okta re-login exists for crashed the CLI instead of triggering it."""
+    the Okta re-login exists for crashed the CLI instead of triggering it.
+    """
     with patch.object(aws_okta.boto3, "Session", return_value=_session_raising(error)):
         assert aws_okta.can_get_to_aws_account() is False
 

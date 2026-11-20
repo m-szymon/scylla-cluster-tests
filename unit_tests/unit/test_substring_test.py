@@ -35,6 +35,7 @@ import yaml
 #       unittest collector picks up any 'unittest.TestCase' subclass in a test module's namespace,
 #       and 'SubstringSearchTest' is one through ClusterTester.
 import substring_test
+from sdcm import sct_abs_path
 from substring_test import (
     CPU_COLUMNS,
     DB_CPU_COLUMN,
@@ -44,16 +45,14 @@ from substring_test import (
     DB_STEAL_COLUMN,
     INDEX_SIZE_METRIC,
     LOADER_CPU_COLUMN,
-    VS_CPU_COLUMN,
     SEARCHES_COLUMN,
     SEARCHES_METRIC,
     SEGMENT_COUNT_METRIC,
-    SUBSTRING_BUILD_COUNT_COLUMN,
     SUBSTRING_WORKLOAD,
+    VS_CPU_COLUMN,
     WALK_COLUMNS,
     WALK_PER_QUERY_METRICS,
     WITH_INDEX_PARAM,
-    SubstringIndexBuildResult,
     checked_index_variants,
     cpu_busy_pct,
     index_option_params,
@@ -65,7 +64,6 @@ from substring_test import (
     segment_spans_pct,
     walk_per_query,
 )
-from sdcm import sct_abs_path
 
 RUNE_PARAM_RE = re.compile(r"""latte::param!\(\s*["'](?P<name>[^"']+)["']""")
 RUNE_FUNCTION_RE = re.compile(r"^pub async fn (?P<name>\w+)", re.MULTILINE)
@@ -102,7 +100,8 @@ def test_every_mapped_parameter_is_a_parameter_of_the_script(script_source):
 
 def test_the_index_option_parameters_exist(script_source):
     """The test case passes these through 'latte_schema_parameters'; a rename there makes the run
-    silently build an index with the server defaults instead of the ones it reports."""
+    silently build an index with the server defaults instead of the ones it reports.
+    """
     declared = set(RUNE_PARAM_RE.findall(script_source))
     assert {"min_gram", "max_gram", "case_sensitive"} <= declared
 
@@ -110,7 +109,8 @@ def test_the_index_option_parameters_exist(script_source):
 def test_the_with_index_parameter_exists(script_source):
     """'index_during_load' creates the index through this parameter before the rows are written. If
     it is renamed, the schema call quietly creates no index, the load writes into an unindexed
-    table, and the run then waits for a count that never arrives."""
+    table, and the run then waits for a count that never arrives.
+    """
     assert WITH_INDEX_PARAM in set(RUNE_PARAM_RE.findall(script_source))
 
 
@@ -121,7 +121,8 @@ def test_the_schema_phase_can_create_the_index(script_source):
 
 def test_the_hdr_tag_names_a_function_of_the_script(script_source):
     """The tag is 'fn--<function>'; latte emits nothing under it if that function is not there,
-    and the latency table would come out empty."""
+    and the latency table would come out empty.
+    """
     function = SUBSTRING_WORKLOAD.hdr_tag.removeprefix("fn--")
     assert function in set(RUNE_FUNCTION_RE.findall(script_source))
 
@@ -135,7 +136,8 @@ def test_the_phases_the_flow_invokes_exist(script_source):
 def test_the_query_is_a_containment_like(script_source):
     """The whole feature under test is that a '%keyword%' LIKE is answered from the index. A script
     that lost the LIKE, or grew an ALLOW FILTERING, would still run and still report latency -- of a
-    table scan."""
+    table scan.
+    """
     assert "LIKE :pattern" in script_source
     assert "ALLOW FILTERING" not in script_source
 
@@ -145,18 +147,10 @@ def test_the_step_record_file_key_shares_the_scripts_vocabulary():
     assert SUBSTRING_WORKLOAD.step_records_file_key == SUBSTRING_WORKLOAD.params.records_file
 
 
-def test_index_build_table_counts_names():
-    """The count column is named once and reused, since Argus keys the table's history by it."""
-    columns = SubstringIndexBuildResult.Meta.Columns
-    assert SUBSTRING_BUILD_COUNT_COLUMN in {column.name for column in columns}
-    assert SUBSTRING_WORKLOAD.build_count_column == SUBSTRING_BUILD_COUNT_COLUMN
-
-
 def test_result_names_are_the_ones_the_history_is_under():
     """Renaming any of these silently starts a new, empty history."""
-    assert SubstringIndexBuildResult.Meta.name == "Substring Index Build Time"
-    assert SUBSTRING_WORKLOAD.name == "substring_search"  # cycle names: 'substring_search_p99_100ms'
-    assert SUBSTRING_WORKLOAD.item_noun == "names"  # row labels: 'ds | 1,000,000 names | char2'
+    assert SUBSTRING_WORKLOAD.name == "substring_search"
+    assert SUBSTRING_WORKLOAD.table_prefix == "Substring"
     assert SUBSTRING_WORKLOAD.index_prefix == "sub_idx"
 
 
@@ -173,7 +167,8 @@ def test_gauge_is_read_for_the_named_index():
 
 def test_gauge_does_not_leak_between_indexes_or_metrics():
     """Three ways to read the wrong number: the next step's index, another keyspace, and the
-    full-text gauge, whose name ends in the same words and whose labels are identical."""
+    full-text gauge, whose name ends in the same words and whose labels are identical.
+    """
     assert parse_index_gauge(METRICS_SAMPLE, INDEX_SIZE_METRIC, "substring_bench", "sub_idx_names_10M_1") == 32212254720
     assert parse_index_gauge(METRICS_SAMPLE, INDEX_SIZE_METRIC, "other_ks", "sub_idx_names_10M_0") is None
     assert parse_index_gauge(METRICS_SAMPLE, "index_size_bytes", "substring_bench", "sub_idx_names_10M_0") is None
@@ -181,7 +176,8 @@ def test_gauge_does_not_leak_between_indexes_or_metrics():
 
 def test_a_missing_gauge_is_no_measurement_rather_than_an_error():
     """An index vector-store has not accounted for yet, and an older build without these gauges,
-    both look like this -- and neither should end a run that is otherwise fine."""
+    both look like this -- and neither should end a run that is otherwise fine.
+    """
     assert parse_index_gauge(METRICS_SAMPLE, INDEX_SIZE_METRIC, "substring_bench", "sub_idx_absent") is None
     assert parse_index_gauge("", INDEX_SIZE_METRIC, "substring_bench", "sub_idx_names_10M_0") is None
 
@@ -445,7 +441,8 @@ def test_the_variant_label_ends_the_row_label():
 
 def test_the_ordering_parameters_exist(script_source):
     """The plan's 'ordered' and 'window' keys become these. A rename makes latte ignore the flag
-    and run the plain query, which still reports a latency -- of the wrong question."""
+    and run the plain query, which still reports a latency -- of the wrong question.
+    """
     declared = set(RUNE_PARAM_RE.findall(script_source))
     assert {
         "order_by",
@@ -466,7 +463,8 @@ def test_the_script_can_emit_an_order_by_clause(script_source):
 
 def test_an_ordered_shape_without_an_ordered_index_is_refused(script_source):
     """The one failure here that yields a plausible number for the wrong thing: without a sort
-    column the ordered clauses are dropped and the plain query is measured under the ordered row."""
+    column the ordered clauses are dropped and the plain query is measured under the ordered row.
+    """
     assert "search_ordered/search_window_from need an index created with order_by" in script_source
 
 
@@ -488,21 +486,24 @@ def test_an_ordered_shape_without_an_ordered_index_is_refused(script_source):
 def test_the_shape_is_part_of_the_row_label(query, expected):
     """Argus keys a cell by (row, column), so a set asked plain and ordered in one step must not
     share a label -- the two would push conflicting latencies into a single row. The shape belongs
-    in the label rather than a column because it changes what the number means."""
+    in the label rather than a column because it changes what the number means.
+    """
     assert substring_test.SubstringSearchTest.query_shape_label(None, query) == expected
 
 
 @pytest.mark.parametrize("window", [-0.1, 1.0, 1.5, "half", True])
 def test_a_window_outside_the_order_is_a_plan_error(window):
     """A fraction at or above 1 bounds the query below every value in the corpus and would measure
-    an empty answer at a plausible-looking latency."""
+    an empty answer at a plausible-looking latency.
+    """
     with pytest.raises(ValueError):
         substring_test._checked_window(window)
 
 
 def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
     """A plan entry asking for 'ordered' against a test case with no 'order_by' would fail inside
-    the loader, after the corpus is loaded and indexed. Checked here against the tracked pairs."""
+    the loader, after the corpus is loaded and indexed. Checked here against the tracked pairs.
+    """
     for case_name, plan_name in (
         ("substring-search-test-docker.yaml", "local_config.yaml"),
         ("substring-search-test.yaml", "aws_config.yaml"),
@@ -538,7 +539,8 @@ def test_the_plans_only_ask_for_ordering_where_the_index_can_order():
 )
 def test_the_direction_and_the_match_become_script_parameters(query, expected):
     """'order: asc' and 'match: prefix|suffix' reach latte as parameters; the defaults are not
-    spelled out, so a script that predates them runs unchanged."""
+    spelled out, so a script that predates them runs unchanged.
+    """
     test = object.__new__(substring_test.SubstringSearchTest)
     test.params = {"latte_schema_parameters": {"order_by": "register_time"}}
     assert test.extra_search_params(query, 3000) == expected
@@ -555,7 +557,8 @@ def test_the_direction_and_the_match_become_script_parameters(query, expected):
 )
 def test_the_served_index_probe_asks_in_the_queries_shape(query, expected):
     """The probe that finds the serving index orders as the step's queries do and nothing more:
-    the ORDER BY is what picks among the pattern indexes on a column."""
+    the ORDER BY is what picks among the pattern indexes on a column.
+    """
     assert substring_test.SubstringSearchTest._probe_shape(None, query) == expected
 
 
@@ -951,6 +954,28 @@ def test_a_phase_after_a_writer_waits_for_the_index_to_settle():
         test._settle_after_writes(query)
     # Only the phase right after the writer ones waits.
     assert waits == [("ks", "idx", 600)]
+
+
+def test_a_writer_runs_for_the_phase_and_its_tail_and_no_longer():
+    """'run_latte_thread' writes an explicit 'duration' over the command's own '--duration': a
+    writer given one as its timeout wrote for 12 minutes through a 60 s phase.
+    """
+    test = object.__new__(substring_test.SubstringSearchTest)
+    test.log = logging.getLogger("test_substring_test")
+    test._write_next = 1_000_000
+    test._step_context = {
+        "defaults": {"duration": "60s"},
+        "local_ds_dir": "/local/ds",
+        "remote_ds_dir": "/remote/ds",
+        "record_count": 1_000_000,
+    }
+    calls = []
+    test.run_latte_thread = lambda **kwargs: calls.append(kwargs)
+    test._start_writer({"set": "char2", "write_rate": 5000})
+    (call,) = calls
+    assert "duration" not in call
+    assert f" --duration {60 + substring_test.WRITER_TAIL_SECS}s " in call["stress_cmd"]
+    assert test._write_next == 1_000_000 + 5000 * (60 + substring_test.WRITER_TAIL_SECS)
 
 
 def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():

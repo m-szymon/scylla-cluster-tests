@@ -4,7 +4,7 @@
 
 The monitoring stack, event severities, Argus reporting and email reports.
 
-**17 options.**
+**18 options.**
 
 
 <a id="argus_email_report_template"></a>
@@ -140,6 +140,17 @@ Extra Grafana screenshots to capture at log-collection time, on top of the Overv
 **default:** []
 
 **type:** list[sdcm.sct_config.GrafanaPanelScreenshot]
+
+
+<a id="grafana_screenshots_per_cycle"></a>
+
+## **grafana_screenshots_per_cycle** / SCT_GRAFANA_SCREENSHOTS_PER_CYCLE
+
+Take Grafana screenshots at the end of every latency_calculator_decorator cycle. About a minute each; a benchmark with many short phases can turn them off and rely on the end-of-test ones.
+
+**default:** True
+
+**type:** bool
 
 
 <a id="max_events_severities"></a>

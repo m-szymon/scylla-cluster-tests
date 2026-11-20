@@ -65,7 +65,7 @@ datasets:
     defaults:
       limit: 20
       duration: 60s
-      concurrency: 64
+      stress_options: {concurrency: 64}
       rate: 0
       expected_p99_read_ms: 100
     steps:

@@ -37,12 +37,12 @@ from sdcm.sct_config import simulated_racks_enabled
 from sdcm.sct_events.database import DatabaseLogEvent
 from sdcm.sct_events.filters import DbEventsFilter
 from sdcm.utils.docker_utils import (
-    running_in_podman,
     Container,
     ContainerManager,
     DockerException,
     _default_docker_client,
     get_docker_bridge_gateway,
+    running_in_podman,
 )
 from sdcm.utils.health_checker import check_nodes_status
 from sdcm.utils.net import get_my_public_ip

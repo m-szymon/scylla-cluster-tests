@@ -140,9 +140,7 @@ def _make_name(rng: random.Random, long_names: bool = False) -> str:
     return name[:MAX_NAME_CHARS]
 
 
-def _generate_names(
-    count: int, seed: int, sort_order: str, long_names: bool = False
-) -> list[tuple[str, str, int]]:
+def _generate_names(count: int, seed: int, sort_order: str, long_names: bool = False) -> list[tuple[str, str, int]]:
     """The corpus, in the order it is written: id, name, and the value an ordered index sorts by.
 
     The sort values are always 0..count-1, so both orders index the same values; `shuffled` only
@@ -183,7 +181,8 @@ def _pick_keywords(counts: Counter, sampled: int, low: float, high: float, wante
 def _long_keywords(names: list[tuple[str, str, int]], sample: int, length: int, wanted: int) -> list[str]:
     """`wanted` keywords of `length` characters, each the middle of a different long name, the
     names spread evenly over the sample so that the keywords sit all over the sort range. Each
-    matches the name it came from and rarely any other: the rare long keyword."""
+    matches the name it came from and rarely any other: the rare long keyword.
+    """
     long_names = [name for _, name, _sort_value in names[:sample] if len(name) >= length]
     if not long_names:
         return []
@@ -257,7 +256,9 @@ def generate(
         "char4": _pick_keywords(counts4, sample, 0.0, 0.01, 10),
         "latin": _latin_keywords(_substring_counts(names, 3, sample), 10),
         # Long keywords, each from a different long name and matching few names besides it.
-        **({f"char{length}": _long_keywords(names, sample, length, 10) for length in (8, 16, 32)} if long_names else {}),
+        **(
+            {f"char{length}": _long_keywords(names, sample, length, 10) for length in (8, 16, 32)} if long_names else {}
+        ),
         # Keywords no generated name can contain: none of the pools hold these characters.
         "miss": ["㊙㊗", "ΩΨΔ", "zzqx"],
     }

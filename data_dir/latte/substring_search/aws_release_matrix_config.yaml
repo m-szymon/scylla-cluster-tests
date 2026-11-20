@@ -46,7 +46,7 @@ datasets:
     defaults:
       limit: 20
       duration: 60s
-      concurrency: 64
+      stress_options: {concurrency: 64}
       rate: 0
       expected_p99_read_ms: 100
     steps:
@@ -67,13 +67,13 @@ datasets:
           - {set: char8_common, ordered: true, profile: true}
           - {set: char12_common, ordered: true}
           # saturated or latency-bound
-          - {set: char2, ordered: true, concurrency: 128}
-          - {set: char2, ordered: true, concurrency: 256}
+          - {set: char2, ordered: true, stress_options: {concurrency: 128}}
+          - {set: char2, ordered: true, stress_options: {concurrency: 256}}
           # cost of a row against cost of a query
           - {set: char2, ordered: true, limit: 1, profile: true}
           - {set: char2, ordered: true, limit: 5}
           - {set: char2, ordered: true, limit: 50}
           # latency, below capacity
-          - {set: char2, ordered: true, rate: 2000, concurrency: 16}
-          - {set: char4, ordered: true, rate: 2000, concurrency: 16}
-          - {set: char8_common, ordered: true, rate: 2000, concurrency: 16}
+          - {set: char2, ordered: true, rate: 2000, stress_options: {concurrency: 16}}
+          - {set: char4, ordered: true, rate: 2000, stress_options: {concurrency: 16}}
+          - {set: char8_common, ordered: true, rate: 2000, stress_options: {concurrency: 16}}

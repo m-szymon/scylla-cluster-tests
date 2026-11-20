@@ -40,7 +40,7 @@ def can_get_to_aws_account():
         response = sts.get_caller_identity()
         assert response["Account"] == account_id
         LOGGER.info("logged in as %s", response["Arn"])
-    except (NoCredentialsError, AssertionError, ClientError):
+    except NoCredentialsError, AssertionError, ClientError:
         # An expired token is the case this whole function exists to detect, and STS reports it as a
         # ClientError rather than by failing to find credentials -- so without it here, the one
         # condition the Okta re-login is for crashes the CLI instead of triggering it.

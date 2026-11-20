@@ -79,7 +79,7 @@ def read_queries(path):
 
 
 def spread(items, k):
-    """k items evenly spaced through an already sorted list."""
+    """K items evenly spaced through an already sorted list."""
     if len(items) <= k:
         return list(items)
     return [items[round(i * (len(items) - 1) / (k - 1))] for i in range(k)]
@@ -166,7 +166,7 @@ def write_queries(dest, name, keywords):
             f.write(f"{name}_{i:03d}\t{kw}\n")
 
 
-def main():
+def main():  # noqa: PLR0912, PLR0914, PLR0915
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, help="source dataset directory, next to this script")
     ap.add_argument("--dest", required=True, help="dataset directory to write, next to this script")
@@ -205,7 +205,9 @@ def main():
     if len(rare_chars) < 3 * KEYWORDS_PER_SET:
         raise SystemExit(f"only {len(rare_chars)} characters of the pool are absent from the corpus")
     rare1 = rare_chars[:KEYWORDS_PER_SET]
-    rare2 = [rare_chars[KEYWORDS_PER_SET + 2 * i] + rare_chars[KEYWORDS_PER_SET + 2 * i + 1] for i in range(KEYWORDS_PER_SET)]
+    rare2 = [
+        rare_chars[KEYWORDS_PER_SET + 2 * i] + rare_chars[KEYWORDS_PER_SET + 2 * i + 1] for i in range(KEYWORDS_PER_SET)
+    ]
 
     # Which rows carry which token, and whether it goes before or after the name.
     tokens = {}
@@ -236,7 +238,7 @@ def main():
                 out = open(dest_shards[row // per_shard], "w", encoding="utf-8")
             if row in tokens:
                 token, before = tokens[row]
-                name = token + name if before else name + token
+                name = token + name if before else name + token  # noqa: PLW2901
             out.write(f"{uid}\t{name}\t{sort}\n")
             if row < sample_size:
                 sample.append(name)
@@ -248,7 +250,10 @@ def main():
     # The query sets.
     sets = {}
     if subset:
-        common = {k: [kw for _, kw in read_queries(os.path.join(source, f"queries_{k}.tsv"))] for k in ("char1", "char2", "miss")}
+        common = {
+            k: [kw for _, kw in read_queries(os.path.join(source, f"queries_{k}.tsv"))]
+            for k in ("char1", "char2", "miss")
+        }
         sets.update(common)
         sets["char4"] = choose_by_count(rng, sample, dest_shards, 4, 1000, total, scale, "char4")
         sets["char8"] = needles(rng, sample, 8, "char8")
@@ -303,7 +308,9 @@ def main():
                             f.write(f"{set_name}_{i:03d}\t{uid}\t1\n")
                 rows = [len(pages[kw]) for kw in kws]
                 # A keyword that dropped out early matched at least `limit` names below the cursor.
-                found = [str(matches[kw]) if kw in active or matches[kw] < args.limit else f">={matches[kw]}" for kw in kws]
+                found = [
+                    str(matches[kw]) if kw in active or matches[kw] < args.limit else f">={matches[kw]}" for kw in kws
+                ]
                 mean = sum(rows) / len(rows)
                 counts.write(f"{set_name}\t{mean:.1f}\t{','.join(found)}\n")
                 if not suffix:
