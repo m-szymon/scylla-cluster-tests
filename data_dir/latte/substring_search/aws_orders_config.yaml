@@ -41,8 +41,10 @@
 # Profiles (DB node and index node, 20 s from 70 s in): char2 in table order, char8_common in tier
 # order, char2 with random writes in register_time order.
 #
-# Run with the case-sensitive overlay and the release package of scylladb 8f3590ce22 or later; the
-# vector-store node builds pattern-index-poc from GitHub:
+# Run with the case-sensitive overlay and a release package of scylladb's
+# pattern-index-poc-upstream-split; the vector-store node builds pattern-index-poc-upstream from
+# GitHub (both moved onto upstream on 2026-11-21; run 7a300b9d, 2026-11-04, is the same plan on the
+# branches before the move):
 #   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config VS_TYPE=r8g.xlarge port_aws_chain.sh
 #
 # Budget: provisioning ~20 min; A: load and ingest of three indexes ~35 min, 21 phases at ~2.3 min
@@ -65,7 +67,7 @@ datasets:
     defaults:
       limit: 20
       duration: 60s
-      concurrency: 64
+      stress_options: {concurrency: 64}
       rate: 0
       expected_p99_read_ms: 100
     steps:

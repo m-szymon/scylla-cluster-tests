@@ -295,7 +295,9 @@ def cli(ctx):
         # Popped: SCTConfiguration refuses an SCT_* variable that is not one of its fields.
         if os.environ.pop("SCT_SKIP_AWS_LOGIN", None) == "1":
             if not Path("~/.ssh/scylla_test_id_ed25519").expanduser().exists():
-                raise click.UsageError("SCT_SKIP_AWS_LOGIN=1 needs ~/.ssh/scylla_test_id_ed25519 from an earlier logged-in run")
+                raise click.UsageError(
+                    "SCT_SKIP_AWS_LOGIN=1 needs ~/.ssh/scylla_test_id_ed25519 from an earlier logged-in run"
+                )
             click.secho("SCT_SKIP_AWS_LOGIN=1: not logging in to AWS, not syncing the test key", fg="yellow")
             return
         try_auth_with_okta()

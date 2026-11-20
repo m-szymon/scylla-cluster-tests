@@ -38,14 +38,14 @@ datasets:
     defaults:
       limit: 20
       duration: 60s
-      concurrency: 64
+      stress_options: {concurrency: 64}
       rate: 0
       expected_p99_read_ms: 100
     steps:
       - shards: [0..9]
         queries:
           - {set: char2, ordered: true, profile: true}
-          - {set: char2, ordered: true, concurrency: 256}
+          - {set: char2, ordered: true, stress_options: {concurrency: 256}}
           - {set: char2, ordered: true, all_loaders: true}
           - {set: char1, ordered: true}
           - {set: char4, ordered: true}

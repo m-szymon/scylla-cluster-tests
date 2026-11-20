@@ -51,7 +51,7 @@ TIE_VALUES = 5
 
 
 def tie_of(sort: int) -> int:
-    """substring.rn's tie_of(): the row's tier, from its sort value."""
+    """The row's tier, from its sort value, as substring.rn computes it."""
     return ((sort % 1000003) * 7919 + 13) % 1000003 % TIE_VALUES
 
 

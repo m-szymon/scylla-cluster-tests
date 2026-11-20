@@ -50,7 +50,7 @@ datasets:
       # The search box shows 20 results per page.
       limit: 20
       duration: 120s
-      concurrency: 32
+      stress_options: {concurrency: 32}
       rate: 0
       expected_p99_read_ms: 100
     steps:
@@ -59,25 +59,25 @@ datasets:
           # Two characters: the typical search-box query, and the one to judge the design by.
           # A realistic load first, so there is a latency reading that is not near saturation.
           - set: char2
-            concurrency: 16
+            stress_options: {concurrency: 16}
             rate: 2000
           # The rate the design was written against.
           - set: char2
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           # Unthrottled: where it actually tops out. If this lands near the loader's own limit,
           # the number is the loader's rather than the cluster's -- raise 'n_loaders' and repeat.
           - set: char2
-            concurrency: 128
+            stress_options: {concurrency: 128}
           # One character: the largest answers, where stopping at LIMIT matters most. One phase,
           # to see whether the hot case tracks the typical one or falls apart.
           - set: char1
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           # Four characters: past max_gram, so gram intersection plus verification of every
           # candidate. The most expensive shape the index serves, so it bounds the rest.
           - set: char4
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
 
           # --- ordering ------------------------------------------------------------------------
@@ -94,12 +94,12 @@ datasets:
           #       index without 'order_by': char2 at 10k offered, 9,704 op/s, 6.57 ms service time.
           - set: char2
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           # Unthrottled, to see where ordering tops out against the plain ceiling.
           - set: char2
             ordered: true
-            concurrency: 128
+            stress_options: {concurrency: 128}
           # A later page: the query a cursor halfway down the order produces. Paging is the whole
           # reason the cursor exists, and the claim is that page 50 costs what page 1 costs -- so
           # this row should match the ordered row above. If it is slower, the cursor is not doing
@@ -107,13 +107,13 @@ datasets:
           - set: char2
             ordered: true
             window: 0.5
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           # The hot case, ordered: the largest answers are where a walk of every match hurts most,
           # so this is where pruning either shows or does not.
           - set: char1
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
 
   # The same corpus, written in an order that leaves the index no usable segment bounds.
@@ -136,7 +136,7 @@ datasets:
     defaults:
       limit: 20
       duration: 120s
-      concurrency: 32
+      stress_options: {concurrency: 32}
       rate: 0
       expected_p99_read_ms: 100
     steps:
@@ -144,17 +144,17 @@ datasets:
         queries:
           - set: char2
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char2
             ordered: true
-            concurrency: 128
+            stress_options: {concurrency: 128}
           - set: char2
             ordered: true
             window: 0.5
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000
           - set: char1
             ordered: true
-            concurrency: 64
+            stress_options: {concurrency: 64}
             rate: 10000

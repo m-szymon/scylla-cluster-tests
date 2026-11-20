@@ -47,7 +47,7 @@ datasets:
     defaults:
       limit: 20
       duration: 60s
-      concurrency: 64
+      stress_options: {concurrency: 64}
       rate: 0
       expected_p99_read_ms: 100
     steps:
@@ -64,8 +64,8 @@ datasets:
           - {set: char32, ordered: true}
           - {set: miss, ordered: true}
           # latency, below capacity
-          - {set: char2, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
-          - {set: char4, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
-          - {set: char8, ordered: true, rate: 2000, concurrency: 16, duration: 60s}
-          - {set: char16, ordered: true, rate: 1000, concurrency: 16, duration: 60s}
-          - {set: char32, ordered: true, rate: 500, concurrency: 16, duration: 60s}
+          - {set: char2, ordered: true, rate: 2000, stress_options: {concurrency: 16}, duration: 60s}
+          - {set: char4, ordered: true, rate: 2000, stress_options: {concurrency: 16}, duration: 60s}
+          - {set: char8, ordered: true, rate: 2000, stress_options: {concurrency: 16}, duration: 60s}
+          - {set: char16, ordered: true, rate: 1000, stress_options: {concurrency: 16}, duration: 60s}
+          - {set: char32, ordered: true, rate: 500, stress_options: {concurrency: 16}, duration: 60s}

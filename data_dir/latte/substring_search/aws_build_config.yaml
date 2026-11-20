@@ -28,7 +28,7 @@ datasets:
     defaults:
       # The search box shows 20 results per page.
       limit: 20
-      concurrency: 32
+      stress_options: {concurrency: 32}
       rate: 0
       duration: 60s
       expected_p99_read_ms: 100
@@ -38,17 +38,17 @@ datasets:
         queries:
           # One character: the largest answers, and the case where stopping at LIMIT matters most.
           - set: char1
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char1
           # Two characters: the typical search-box query.
           - set: char2
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char2
           # Four characters: past max_gram, so gram intersection plus verification.
           - set: char4
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char4
           # An empty answer, for the floor of the latency range.
@@ -57,15 +57,15 @@ datasets:
       - shards: [10..99]
         queries:
           - set: char1
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char1
           - set: char2
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char2
           - set: char4
-            concurrency: 1
+            stress_options: {concurrency: 1}
             rate: 50
           - set: char4
           - set: latin
