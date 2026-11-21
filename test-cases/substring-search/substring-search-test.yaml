@@ -102,6 +102,8 @@ instance_type_vector_store: 'c8g.xlarge'
 # noise. These are that run's images. Move them on purpose, in a commit of its own, and expect the
 # numbers to move with them. A run that falls back to another region re-resolves them.
 ami_id_db_scylla: 'ami-0445442ed20a2c6f8'     # ubuntu-noble-24.04-amd64-server-20261023
+# The user of that image: with 'unified_package' SCT no longer assumes it.
+ami_db_scylla_user: 'ubuntu'
 ami_id_vector_store: 'ami-000a6958bb393ce5c'  # vector-store-1-14-0-arm64, replaced by the source build
 ami_id_loader: 'ami-04a5090d5908028ad'        # ubuntu-resolute-26.04-amd64-server-20261022
 ami_id_monitor: 'ami-08b1667b12dd0fe46'       # scylladb-monitor-4-16-0-amd64
