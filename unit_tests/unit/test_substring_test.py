@@ -313,36 +313,45 @@ def test_thread_states_are_read_from_the_sampler():
     assert parse_thread_states(text) == {"tokio-rt-worker R": 3.61, "tokio-rt-worker S": 1.39}
 
 
-def _run_sampler(tmp_path, delay: int, window: int, stop_after: float) -> str:
-    """The sampler's output for this test's own process, the stop file touched after 'stop_after'."""
+def _run_sampler(tmp_path, stop_after: float, window: str | None = None) -> str:
+    """The sampler's output for this test's own process, stopped after 'stop_after' with that window."""
     script = tmp_path / "vs_threads.sh"
     script.write_text(substring_test.VS_THREAD_SAMPLER)
     out = tmp_path / "out"
     with open(f"/proc/{os.getpid()}/comm") as comm:
         name = comm.read().strip()
-    sampler = subprocess.Popen(["sh", str(script), name, str(delay), str(window), str(out)])
+    sampler = subprocess.Popen(["sh", str(script), name, str(out)])
     time.sleep(stop_after)
+    if window is not None:
+        (tmp_path / "out.window").write_text(window)
     (tmp_path / "out.stop").touch()
     sampler.wait(timeout=10)
     return out.read_text()
 
 
 @pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="the sampler reads /proc")
-def test_the_thread_sampler_does_not_wait_out_its_delay_at_the_end_of_a_phase(tmp_path):
-    # A phase shorter than the delay: the end of the phase stops the sampler with nothing sampled.
+def test_the_thread_sampler_reports_nothing_for_a_window_it_has_no_sample_in(tmp_path):
+    # The queries' window as latte timed it is long past: nothing sampled falls in it.
     started = time.monotonic()
-    text = _run_sampler(tmp_path, delay=600, window=20, stop_after=0.5)
+    text = _run_sampler(tmp_path, stop_after=1.0, window="1000 2000\n")
     assert time.monotonic() - started < 5
     assert text.startswith("no samples")
     assert parse_thread_states(text) == {}
 
 
 @pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="the sampler reads /proc")
-def test_the_thread_sampler_reports_what_it_sampled_when_stopped_in_the_window(tmp_path):
-    started = time.monotonic()
-    text = _run_sampler(tmp_path, delay=0, window=600, stop_after=1.0)
-    assert time.monotonic() - started < 5
-    assert parse_thread_states(text)
+def test_the_thread_sampler_reports_the_samples_of_the_window(tmp_path):
+    now = int(time.time())
+    text = _run_sampler(tmp_path, stop_after=1.5, window=f"{now} {now + 60}\n")
+    states = parse_thread_states(text)
+    assert states
+    # Averages over the samples of the window: this process has at least one thread, in some state.
+    assert sum(states.values()) >= 1.0
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="the sampler reads /proc")
+def test_the_thread_sampler_reports_all_it_sampled_without_a_window(tmp_path):
+    assert parse_thread_states(_run_sampler(tmp_path, stop_after=1.0))
 
 
 def test_every_cpu_quantity_is_a_column():
@@ -993,30 +1002,44 @@ def test_a_cpu_snapshot_reads_the_clock_the_stat_line_and_the_reactors():
     assert substring_test.parse_cpu_snapshot("") == {}
 
 
-def _run_cpu_window(tmp_path, delay: int, window: int, stop_after: float) -> tuple[str, str]:
+@pytest.mark.skipif(not os.path.isfile("/proc/stat"), reason="the readings come from /proc/stat")
+def test_the_cpu_readings_go_on_until_stopped_and_end_with_one(tmp_path):
     script = tmp_path / "cpu_window.sh"
     script.write_text(substring_test.CPU_WINDOW_SCRIPT)
     out = tmp_path / "w"
-    window_proc = subprocess.Popen(["sh", str(script), str(delay), str(window), str(out)])
-    time.sleep(stop_after)
-    (tmp_path / "w.stop").touch()
-    window_proc.wait(timeout=10)
-    assert (tmp_path / "w.done").exists()
-    return tuple((tmp_path / f"w.{part}").read_text() if (tmp_path / f"w.{part}").exists() else "" for part in "ab")
-
-
-@pytest.mark.skipif(not os.path.isfile("/proc/stat"), reason="the window reads /proc/stat")
-def test_the_cpu_window_reads_the_window_and_skips_a_phase_that_ends_first(tmp_path):
-    first, second = _run_cpu_window(tmp_path, delay=0, window=600, stop_after=1.5)
-    start, end = substring_test.parse_cpu_snapshot(first), substring_test.parse_cpu_snapshot(second)
-    assert end["time"] > start["time"]
-    assert end["stat"]["total"] > start["stat"]["total"]
-    # A phase shorter than the delay: stopped before the window began, it read nothing, at once.
-    short = tmp_path / "short"
-    short.mkdir()
     started = time.monotonic()
-    assert _run_cpu_window(short, delay=600, window=20, stop_after=0.5) == ("", "")
-    assert time.monotonic() - started < 5
+    readings = subprocess.Popen(["sh", str(script), "1", str(out)])
+    time.sleep(2.5)
+    (tmp_path / "w.stop").touch()
+    readings.wait(timeout=10)
+    assert time.monotonic() - started < 6
+    assert (tmp_path / "w.done").exists()
+    snapshots = substring_test.parse_cpu_snapshots((tmp_path / "w.log").read_text())
+    assert len(snapshots) >= 3
+    assert all(later["time"] > earlier["time"] for earlier, later in zip(snapshots, snapshots[1:]))
+    assert snapshots[-1]["stat"]["total"] > snapshots[0]["stat"]["total"]
+
+
+def test_the_queries_window_is_what_latte_timed_less_the_warm_up():
+    # A minute of queries: the first ten seconds are warm-up.
+    assert substring_test.query_window({"start_time": 1_000_000.0, "end_time": 1_060_000.0}) == (1010.0, 1060.0)
+    # Twenty seconds: a quarter of them.
+    assert substring_test.query_window({"start_time": 1_000_000.0, "end_time": 1_020_000.0}) == (1005.0, 1020.0)
+    # Too short to have a window, and no histogram at all.
+    assert substring_test.query_window({"start_time": 1_000_000.0, "end_time": 1_004_000.0}) is None
+    assert substring_test.query_window({}) is None
+    assert substring_test.query_window(None) is None
+
+
+def test_the_cpu_window_is_the_readings_that_bracket_the_queries():
+    """Run a2b5883f: the window opened a fixed 70 s into the phase, after the queries had ended."""
+    snapshots = [{"time": float(second)} for second in range(1000, 1100, 2)]
+    first, last = substring_test.bracket_window(snapshots, (1010.5, 1060.0))
+    assert (first["time"], last["time"]) == (1012.0, 1060.0)
+    # No reading in the window, and readings too close to tell anything.
+    assert substring_test.bracket_window(snapshots, (2000.0, 2060.0)) is None
+    assert substring_test.bracket_window(snapshots, (1010.0, 1012.0)) is None
+    assert substring_test.bracket_window([], (1010.0, 1060.0)) is None
 
 
 @pytest.mark.parametrize(

@@ -1061,11 +1061,13 @@ class SearchPerformanceTest(PerformanceRegressionTest):
         """
         return None
 
-    def search_phase_end(self, phase) -> dict:
+    def search_phase_end(self, phase, latency: dict | None = None) -> dict:
         """Called right after the phase's latte run, with what 'search_phase_begin' returned.
 
-        Returns {field: value} to record with the phase's results. A measurement that could not
-        be taken is left out.
+        *latency* is the run's HDR summary, empty when there is none: its 'start_time' and
+        'end_time' (epoch milliseconds) say when the queries themselves ran, which is later than
+        the phase began by latte's start-up. Returns {field: value} to record with the phase's
+        results. A measurement that could not be taken is left out.
         """
         return {}
 
@@ -1111,7 +1113,7 @@ class SearchPerformanceTest(PerformanceRegressionTest):
                 ignore_parse_errors=ignore_parse_errors,
                 extra_params=self.extra_search_params(query, record_count),
             )
-            measured = self.search_phase_end(phase)
+            measured = self.search_phase_end(phase, latency)
             shape = self.query_shape_label(query)
             if not latency:
                 self.log.warning("No HDR latency summary for query set %s of step #%d", qset, step_number)

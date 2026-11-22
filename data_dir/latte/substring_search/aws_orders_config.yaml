@@ -20,8 +20,8 @@
 # - write_op_rate: what the writer achieved;
 # - segments, rewrite_steps, rewrite_rows, fresh_rows, fresh_segments, depth_*: the layout the
 #   phase ended with and the repair work done during it;
-# - the CPU columns, now over the same 20 s window as the thread states and profiles (70 s into the
-#   phase, inside latte's queries), not the whole phase with its start-up;
+# - the CPU columns and the thread states, over the queries as latte timed them less their first
+#   10 s, not the whole phase with its start-up;
 # - walk costs per query, as before. Segments opened per query is what shows a tie-heavy order
 #   pruning or not.
 #
@@ -38,7 +38,7 @@
 #   (Dataset B, a table-order index against an 'unordered' one, went with the unordered index:
 #   postponed, see vector-store docs/dev/pattern/postponed.md.)
 #
-# Profiles (DB node and index node, 20 s from 70 s in): char2 in table order, char8_common in tier
+# Profiles (DB node and index node, 20 s once the node is busy): char2 in table order, char8_common in tier
 # order, char2 with random writes in register_time order.
 #
 # Run with the case-sensitive overlay and a release package of scylladb's

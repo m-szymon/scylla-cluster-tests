@@ -33,6 +33,7 @@ JSONL into the run's logdir rather than posted -- which is how this test is norm
 """
 
 import base64
+import math
 import os
 import re
 import threading
@@ -250,56 +251,63 @@ VARIANT_ORDERS = ("table", "tie")
 VS_WORKERS_COLUMN = "vs_workers_running"
 VS_WORKER_THREAD = "tokio-rt-worker"
 VS_THREADS_COLUMNS = [ColumnMetadata(name=VS_WORKERS_COLUMN, unit="", type=ResultType.FLOAT, higher_is_better=False)]
-# Run on the index node as 'sh vs_threads.sh <process name> <delay secs> <window secs> <out>': every
-# 10 ms of the window, the state of each of the process's threads, written to <out> once done as
-# '<name> <state> <average count>' lines, the names' trailing digits dropped (R running or
-# runnable, S sleeping, D in I/O). The file '<out>.stop' ends it early, at the end of the phase:
-# over what it sampled until then, or with no samples if the window had not begun -- a short phase
-# does not wait out the delay. Plain sh with 'read' builtins and no pidof or pgrep, which a
-# container need not have.
-VS_THREAD_SAMPLER = r"""pid=
+# Run on the index node as 'sh vs_threads.sh <process name> <out>' for the whole phase: every
+# THREAD_SAMPLE_SECS, the state of each of the process's threads, each sample stamped with the
+# clock's second. The file '<out>.stop' ends it; it then writes to <out> '<name> <state> <average
+# count>' lines, the names' trailing digits dropped (R running or runnable, S sleeping, D in I/O),
+# over the samples from the seconds '<out>.window' names ('<from> <to>', epoch seconds: the phase's
+# queries as latte timed them), or over all of them without that file. A fixed delay into the phase
+# was here before, and sampled an idle node once latte's start-up got shorter (run a2b5883f). Plain
+# sh with 'read' builtins and no pidof or pgrep, which a container need not have.
+THREAD_SAMPLE_SECS = 0.1
+VS_THREAD_SAMPLER = rf"""pid=
 for d in /proc/[0-9]*; do
-    read -r comm < "$d/comm" 2>/dev/null && [ "$comm" = "$1" ] && pid=${d#/proc/} && break
+    read -r comm < "$d/comm" 2>/dev/null && [ "$comm" = "$1" ] && pid=${{d#/proc/}} && break
 done
-i=0
-while [ "$i" -lt "$2" ] && [ ! -e "$4.stop" ]; do
-    sleep 1
-    i=$((i + 1))
-done
-end=$(( $(date +%s) + $3 ))
 n=0
 tmp=$(mktemp)
-while [ -n "$pid" ] && [ "$(date +%s)" -lt "$end" ] && [ ! -e "$4.stop" ]; do
+while [ -n "$pid" ] && [ ! -e "$2.stop" ] && [ "$n" -lt 100000 ]; do
+    now=$(date +%s)
     for f in /proc/"$pid"/task/*/stat; do
         read -r line < "$f" || continue
-        rest=${line#*\(}
-        name=${rest%\)*}
-        after=${line##*\) }
-        printf '%s|%s\n' "$name" "${after%% *}"
+        rest=${{line#*\(}}
+        name=${{rest%\)*}}
+        after=${{line##*\) }}
+        printf '%s|%s|%s|%s\n' "$now" "$n" "$name" "${{after%% *}}"
     done >> "$tmp"
     n=$((n + 1))
-    sleep 0.01
+    sleep {THREAD_SAMPLE_SECS}
 done
+while [ ! -e "$2.stop" ]; do
+    sleep 1
+done
+from=0
+to=9999999999
+[ -e "$2.window" ] && read -r from to < "$2.window"
 if [ -z "$pid" ]; then
-    echo "no process named $1" > "$4.tmp"
-elif [ "$n" -eq 0 ]; then
-    echo "no samples: the phase ended before the window began" > "$4.tmp"
+    echo "no process named $1" > "$2.tmp"
 else
-    sed 's/[0-9-]*|/|/; s/ /_/g' "$tmp" | sort | uniq -c \
-        | awk -v n="$n" '{split($2, a, "|"); printf "%s %s %.2f\n", a[1], a[2], $1 / n}' > "$4.tmp"
+    awk -F'|' -v from="$from" -v to="$to" '
+        $1 >= from && $1 <= to {{
+            if (!($2 in seen)) {{ seen[$2] = 1; n++ }}
+            name = $3; sub(/[0-9-]*$/, "", name); gsub(/ /, "_", name)
+            count[name " " $4]++
+        }}
+        END {{
+            if (n == 0) print "no samples: none fell in the window"
+            else for (key in count) printf "%s %.2f\n", key, count[key] / n
+        }}' "$tmp" > "$2.tmp"
 fi
 rm -f "$tmp"
-mv "$4.tmp" "$4"
+mv "$2.tmp" "$2"
 """
 # A query entry with 'profile: true' samples the DB node's CPUs during the phase: a system-wide
-# 'perf record' (as scylla-perf-collector does; 'perf report --comm scylla' narrows it), from
-# PROFILE_DELAY_SECS into the phase (past the client's start-up: latte's queries began 33-66 s
-# after the phase did in run 0216688f, whose 10 s delay profiled idle nodes) for PROFILE_SECS, PROFILE_HZ
+# 'perf record' (as scylla-perf-collector does; 'perf report --comm scylla' narrows it), once the
+# node is busy (see PROFILE_SCRIPT below), for PROFILE_SECS, PROFILE_HZ
 # samples a second per CPU of the cpu-clock timer -- an EC2 VM exposes no hardware cycle counter --
 # with DWARF call stacks, since a release build keeps no frame pointers. The recording is gzipped
 # and collected to '<logdir>/perf/'; the node's binary is stripped, so it is read against the
 # unstripped build with the same build id.
-PROFILE_DELAY_SECS = 70
 PROFILE_SECS = 20
 PROFILE_HZ = 99
 PROFILE_STACK_BYTES = 8192
@@ -328,33 +336,37 @@ echo "busy after $waited s; recording from $((waited + {PROFILE_SETTLE_SECS})) s
 sleep {PROFILE_SETTLE_SECS}
 perf record -a -e cpu-clock -F "$2" --call-graph "dwarf,$3" -o "$1" -- sleep "$4"
 """
-# Run on each node as 'sh cpu_window.sh <delay secs> <window secs> <out>': the node's CPU reading
-# (the clock, /proc/stat's 'cpu' line, and ScyllaDB's reactor busy times where there is a ScyllaDB)
-# into '<out>.a' PROFILE_DELAY_SECS into the phase and into '<out>.b' at the end of the window or
-# when '<out>.stop' appears, whichever is first; '<out>.done' once it is over. So the CPU columns
-# cover the same window as the profiles and the thread states -- the queries' -- and not the
-# client's start-up, which diluted every CPU figure of run 0216688f by ~1.75x. A phase that ends
-# before the window has no '.a', and its columns fall back to the whole phase.
-CPU_WINDOW_SCRIPT = r"""snap() {
-    { date +%s.%N; head -1 /proc/stat; curl -s --max-time 5 http://localhost:9180/metrics 2>/dev/null \
-        | grep '^scylla_reactor_cpu_busy_ms'; } > "$1.tmp"
-    mv "$1.tmp" "$1"
-}
-i=0
-while [ "$i" -lt "$1" ] && [ ! -e "$3.stop" ]; do
-    sleep 1
-    i=$((i + 1))
-done
-if [ ! -e "$3.stop" ]; then
-    snap "$3.a"
+# Run on each node as 'sh cpu_window.sh <interval secs> <out>' for the whole phase: the node's CPU
+# reading (the clock, /proc/stat's 'cpu' line, and ScyllaDB's reactor busy times where there is a
+# ScyllaDB) appended to '<out>.log' every interval, each followed by CPU_SNAPSHOT_END, until
+# '<out>.stop' appears; '<out>.done' once it is over. The test then takes the two readings that
+# bracket the phase's queries as latte timed them ('query_window'), so the CPU columns cover the
+# queries and not the client's start-up, which diluted every CPU figure of run 0216688f by ~1.75x.
+# A window at a fixed delay into the phase was here before: 70 s in, right for the start-up of its
+# day, and after the queries had ended once the start-up got shorter (run a2b5883f read idle nodes).
+CPU_SNAPSHOT_INTERVAL_SECS = 2
+CPU_SNAPSHOT_END = "--- end of reading ---"
+# The first seconds of the queries are left out of the window: connections, prepared statements and
+# caches warm up in them. At most this long, and at most a quarter of the queries.
+QUERY_WARMUP_SECS = 10
+# The shortest window worth reporting; a shorter one falls back to the whole phase.
+MIN_CPU_WINDOW_SECS = 4
+CPU_WINDOW_SCRIPT = rf"""snap() {{
+    {{ date +%s.%N; head -1 /proc/stat; curl -s --max-time 5 http://localhost:9180/metrics 2>/dev/null \
+        | grep '^scylla_reactor_cpu_busy_ms'; echo '{CPU_SNAPSHOT_END}'; }} >> "$2.log"
+}}
+total=0
+while [ ! -e "$2.stop" ] && [ "$total" -lt 7200 ]; do
+    snap "$@"
     i=0
-    while [ "$i" -lt "$2" ] && [ ! -e "$3.stop" ]; do
+    while [ "$i" -lt "$1" ] && [ ! -e "$2.stop" ]; do
         sleep 1
         i=$((i + 1))
     done
-    snap "$3.b"
-fi
-touch "$3.done"
+    total=$((total + i))
+done
+snap "$@"
+touch "$2.done"
 """
 # How many segments the layout log lists in full; the summary columns cover the rest.
 SEGMENT_LAYOUT_LOG_ROWS = 64
@@ -775,6 +787,33 @@ def parse_cpu_snapshot(text: str) -> dict:
     if (reactor := parse_reactor_busy(text)) is not None:
         snapshot["reactor"] = reactor
     return snapshot
+
+
+def parse_cpu_snapshots(text: str) -> list[dict]:
+    """Every reading of a CPU_WINDOW_SCRIPT log that has its clock, in the order taken."""
+    snapshots = (parse_cpu_snapshot(part.strip()) for part in text.split(CPU_SNAPSHOT_END))
+    return [snapshot for snapshot in snapshots if "time" in snapshot]
+
+
+def query_window(latency: dict | None) -> tuple[float, float] | None:
+    """(from, to) in epoch seconds: the phase's queries as latte timed them, less their warm-up.
+
+    None without the histogram's times, or when what is left is shorter than MIN_CPU_WINDOW_SECS.
+    """
+    start, end = (latency or {}).get("start_time"), (latency or {}).get("end_time")
+    if not start or not end:
+        return None
+    start, end = start / 1000.0, end / 1000.0
+    start += min(QUERY_WARMUP_SECS, (end - start) / 4)
+    return (start, end) if end - start >= MIN_CPU_WINDOW_SECS else None
+
+
+def bracket_window(snapshots: list[dict], window: tuple[float, float]) -> tuple[dict, dict] | None:
+    """The first and the last of the readings inside the window, or None if they are too close."""
+    inside = [snapshot for snapshot in snapshots if window[0] <= snapshot["time"] <= window[1]]
+    if len(inside) < 2 or inside[-1]["time"] - inside[0]["time"] < MIN_CPU_WINDOW_SECS:
+        return None
+    return inside[0], inside[-1]
 
 
 def parse_indexing_lag(metrics_text: str, keyspace: str, index_name: str) -> dict:
@@ -1311,32 +1350,33 @@ class SubstringSearchTest(SearchPerformanceTest):
             "ingest": ingest,
         }
 
-    def search_phase_end(self, phase) -> dict:
+    def search_phase_end(self, phase, latency: dict | None = None) -> dict:
         """What one query of the phase cost the index, how busy each node was, and what the writes did.
 
         The walk totals count every search the index served, so they also see whatever else queried
-        it meanwhile -- nothing does in this flow. The CPU covers the window the profiles and the
-        thread states do, PROFILE_DELAY_SECS in, when the phase lasts that long, and the whole latte
-        run otherwise. The writer is waited for after the windows are closed, so its tail is not in
-        them. A scrape that failed on either side leaves the cells empty rather than reporting a
-        delta against nothing.
+        it meanwhile -- nothing does in this flow. The CPU and the thread states cover the queries
+        as latte timed them, less their warm-up ('query_window'), and the whole latte run, start-up
+        included, when that cannot be had. The writer is waited for after the windows are closed,
+        so its tail is not in them. A scrape that failed on either side leaves the cells empty
+        rather than reporting a delta against nothing.
         """
         self._fan_out = False
         # The CPU first, so that the wait for the index's gauges is not in its window.
         cpu_after = self._scrape_cpu()
-        window = self._collect_cpu_window(phase["cpu_window"])
+        queries = query_window(latency)
+        readings = self._collect_cpu_window(phase["cpu_window"], queries)
         self._wait_for_gauge_refresh()
         walk_after = self._scrape_walk_totals()
-        if window:
-            cpu = cpu_busy_pct(*window)
-            span = window[1]["time"] - window[0]["time"]
-            what = f"over {span:.0f} s from {PROFILE_DELAY_SECS} s into the phase"
+        if readings:
+            cpu = cpu_busy_pct(*readings)
+            span = readings[1]["time"] - readings[0]["time"]
+            what = f"over {span:.0f} s of the queries, from {readings[0]['time'] - latency['start_time'] / 1000.0:.0f} s after they began"
         else:
             cpu = cpu_busy_pct(phase["cpu"], cpu_after)
             what = "over the whole phase"
         if cpu:
             self.log.info("CPU busy %s: %s", what, ", ".join(f"{column}={value}" for column, value in cpu.items()))
-        cpu |= self._collect_thread_sampler(phase["sampler"])
+        cpu |= self._collect_thread_sampler(phase["sampler"], queries)
         for node, name in phase["profiles"]:
             self._collect_profile(node, name)
         cells = dict(cpu)
@@ -1494,8 +1534,8 @@ class SubstringSearchTest(SearchPerformanceTest):
                     self._diag(node).run(f"echo {script} | base64 -d > /tmp/cpu_window.sh", verbose=False, timeout=30)
                     installed.add(node.name)
                 self._diag(node).run(
-                    f"rm -f {out}.a {out}.b {out}.stop {out}.done; "
-                    f"setsid sh /tmp/cpu_window.sh {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
+                    f"rm -f {out}.log {out}.stop {out}.done; "
+                    f"setsid sh /tmp/cpu_window.sh {CPU_SNAPSHOT_INTERVAL_SECS} {out} "
                     f"> /dev/null 2>&1 < /dev/null &",
                     verbose=False,
                     timeout=30,
@@ -1505,11 +1545,11 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self.log.warning("Could not start the CPU window on %s: %s", node.name, exc)
         return started
 
-    def _collect_cpu_window(self, started: list) -> tuple[dict, dict] | None:
-        """Close the windows; ('_scrape_cpu'-shaped reading at the start, at the end), or None.
+    def _collect_cpu_window(self, started: list, queries: tuple[float, float] | None) -> tuple[dict, dict] | None:
+        """Stop the readings; ('_scrape_cpu'-shaped reading at the start of the queries' window, at its end), or None.
 
-        None when the DB node's window never began -- the phase was shorter than the delay -- or
-        could not be read; the caller then reports the whole phase.
+        Each node's two readings are chosen by its own clock. None when the queries' window is not
+        known, or when the DB node has no two readings in it; the caller then reports the whole phase.
         """
         readings = ({}, {})
         for key, node, out in started:
@@ -1518,7 +1558,7 @@ class SubstringSearchTest(SearchPerformanceTest):
                     self._diag(node)
                     .run(
                         f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out}.done ]; do sleep 1; done'; "
-                        f"cat {out}.a 2>/dev/null; echo '--- end of window ---'; cat {out}.b 2>/dev/null",
+                        f"cat {out}.log 2>/dev/null",
                         ignore_status=True,
                         verbose=False,
                         timeout=60,
@@ -1526,21 +1566,21 @@ class SubstringSearchTest(SearchPerformanceTest):
                     .stdout
                 )
             except Exception as exc:  # noqa: BLE001 - a diagnostic, not the measurement
-                self.log.warning("Could not read the CPU window on %s: %s", node.name, exc)
+                self.log.warning("Could not read the CPU readings on %s: %s", node.name, exc)
                 continue
-            first, _, second = text.partition("--- end of window ---")
-            for reading, part in zip(readings, (first, second)):
-                snapshot = parse_cpu_snapshot(part.strip())
+            bracket = bracket_window(parse_cpu_snapshots(text), queries) if queries else None
+            if bracket is None:
+                continue
+            for reading, snapshot in zip(readings, bracket):
                 if key == "db":
-                    if "time" in snapshot:
-                        reading["time"] = snapshot["time"]
+                    reading["time"] = snapshot["time"]
                     if "reactor" in snapshot:
                         reading["db"] = snapshot["reactor"]
                     if "stat" in snapshot:
                         reading["db_host"] = snapshot["stat"]
                 elif "stat" in snapshot:
                     reading[key] = snapshot["stat"]
-        if "time" not in readings[0] or "time" not in readings[1] or readings[1]["time"] <= readings[0]["time"]:
+        if "time" not in readings[0] or "time" not in readings[1]:
             return None
         return readings
 
@@ -1565,7 +1605,7 @@ class SubstringSearchTest(SearchPerformanceTest):
                 self._diag(node).run(f"echo {script} | base64 -d > /tmp/vs_threads.sh", verbose=False, timeout=30)
                 self._sampler_installed = True
             self._diag(node).run(
-                f"rm -f {out} {out}.stop; setsid sh /tmp/vs_threads.sh vector-store {PROFILE_DELAY_SECS} {PROFILE_SECS} {out} "
+                f"rm -f {out} {out}.stop {out}.window; setsid sh /tmp/vs_threads.sh vector-store {out} "
                 f"> /dev/null 2>&1 < /dev/null &",
                 verbose=False,
                 timeout=30,
@@ -1575,14 +1615,18 @@ class SubstringSearchTest(SearchPerformanceTest):
             return None
         return out
 
-    def _collect_thread_sampler(self, out: str | None) -> dict:
-        """The VS_THREADS_COLUMNS cell from the sampler's output, stopping it at the end of the phase."""
+    def _collect_thread_sampler(self, out: str | None, queries: tuple[float, float] | None) -> dict:
+        """The VS_THREADS_COLUMNS cell from the sampler's output over the queries' window, stopping it.
+
+        Without the window, over all it sampled: the phase with its start-up.
+        """
         if out is None:
             return {}
         node = self._vector_store_node()
+        window = f"echo '{math.ceil(queries[0])} {math.floor(queries[1])}' > {out}.window; " if queries else ""
         try:
             self._diag(node).run(
-                f"touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
+                f"{window}touch {out}.stop; timeout 30 sh -c 'while [ ! -e {out} ]; do sleep 1; done'",
                 ignore_status=True,
                 verbose=False,
                 timeout=60,
@@ -1593,7 +1637,7 @@ class SubstringSearchTest(SearchPerformanceTest):
             return {}
         states = parse_thread_states(text)
         if not states:
-            # No samples is what a phase shorter than PROFILE_DELAY_SECS gets, not a failure.
+            # No samples is what a phase too short to have a window gets, not a failure.
             log = self.log.info if text.startswith("no samples") else self.log.warning
             log("The index node's thread sampler said: %s", text.strip()[:300])
             return {}
