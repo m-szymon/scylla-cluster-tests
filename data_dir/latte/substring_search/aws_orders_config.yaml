@@ -47,8 +47,9 @@
 # branches before the move):
 #   MODE=release PKG=<scylla-unified-...> PLAN=aws_orders_config VS_TYPE=r8g.xlarge port_aws_chain.sh
 #
-# Budget: provisioning ~20 min; A: load and ingest of three indexes ~35 min, 21 phases at ~2.3 min
-# ~50 min, 3 profiles ~12 min; log collection and teardown ~12 min: about 2:10.
+# Budget: run a2b5883f took 1:32 -- provisioning ~20 min, load and ingest of three indexes ~35 min,
+# 21 phases and 3 profiles ~35 min, log collection and teardown ~10 min; with the two phases of
+# the clients' sweep, about 1:40.
 datasets:
   - name: names_10M_matrix
     index_during_load: true
@@ -74,6 +75,13 @@ datasets:
       - shards: [0..9]
         queries:
           - {set: char2, profile: true, variants: [table]}
+          # The same query from 16 and from 256 clients. The phases run 64 in a closed loop, so
+          # their q/s is 64 over the time a query takes: run a2b5883f's profile of the phase
+          # above had the DB node a third idle at 8,600 q/s. If the q/s follows the clients, the
+          # phases measure latency and there is room; if it stays, something takes the requests
+          # one after another, and the CPU columns and thread states say on which node.
+          - {set: char2, stress_options: {concurrency: 16}, variants: [table]}
+          - {set: char2, stress_options: {concurrency: 256}, variants: [table]}
           - {set: char8_common, variants: [table]}
           - {set: miss, variants: [table]}
           - {set: char2, write_rate: 2000, variants: [table]}
