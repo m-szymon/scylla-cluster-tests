@@ -6,13 +6,18 @@ DESC LIMIT n``. A pattern index answers in three more orders this script writes 
 a copy of the set's keywords under a new set name:
 
 ``<set>_table``
-    a plain ``LIKE`` (no ORDER BY) against an index with no ``order_by``, which answers in table
-    order: by token of the partition key -- Murmur3 of the ``user_id`` bytes -- then by the key's
-    bytes. Checked with ``check_order: true``.
+    a plain ``LIKE`` (no ORDER BY) against an index with no ``order_by``, which answers partition
+    after partition, the partitions in the index's ``partition_order``. By default that is
+    ``scattered``: by the index node's fixed scramble of the token (``scattered_key()`` here, the
+    node's ``order::scattered_key``) -- the token being Murmur3 of the ``user_id`` bytes -- then
+    by the key's bytes. Checked with ``check_order: true``.
 ``<set>_tier``
     ``ORDER BY tier DESC`` against an index ordered ``'tier DESC'``: ``tier`` is the table's
     low-cardinality column (``tie_column`` in ``substring.rn``), five values derived from the sort
-    value, so most rows tie and the ties come in table order.
+    value, so most rows tie and the ties come in the order of the partitions, as above.
+``<set>_table_token``, ``<set>_tier_token``
+    the same two against indexes created with ``'partition_order': 'token'``: the partitions by
+    token, the order of a scan.
 ``<set>_asc``
     ``ORDER BY <sort> ASC``: the sort column's index the other way round.
 
@@ -55,10 +60,31 @@ def tie_of(sort: int) -> int:
     return ((sort % 1000003) * 7919 + 13) % 1000003 % TIE_VALUES
 
 
-def table_key(uid: str) -> tuple[int, bytes]:
-    """Where a row is in table order: its partition key's token, then the key's bytes."""
+MASK64 = (1 << 64) - 1
+
+
+def scattered_key(token: int) -> int:
+    """The index node's place for a partition under ``partition_order: scattered``.
+
+    The token biased to an unsigned key, through the finalizer of SplitMix64; keep it in step
+    with ``order::scattered_key`` of the vector-store.
+    """
+    key = (token + (1 << 63)) & MASK64
+    key = ((key ^ (key >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    key = ((key ^ (key >> 27)) * 0x94D049BB133111EB) & MASK64
+    return key ^ (key >> 31)
+
+
+def token_key(uid: str) -> tuple[int, bytes]:
+    """Where a row is in the order of a scan: its partition key's token, then the key's bytes."""
     key = uid.encode("utf-8")
     return Murmur3Token.hash_fn(key), key
+
+
+def table_key(uid: str) -> tuple[int, bytes]:
+    """Where a row is in an index's default order of partitions: the scrambled token, then the key's bytes."""
+    token, key = token_key(uid)
+    return scattered_key(token), key
 
 
 def read_rows(dataset_dir: str) -> list[tuple[str, str, int]]:
@@ -79,6 +105,8 @@ def read_queries(path: str) -> list[tuple[str, str]]:
 ORDERS = {
     "table": lambda row: table_key(row[0]),
     "tier": lambda row: (-tie_of(row[2]),) + table_key(row[0]),
+    "table_token": lambda row: token_key(row[0]),
+    "tier_token": lambda row: (-tie_of(row[2]),) + token_key(row[0]),
     "asc": lambda row: row[2],
 }
 

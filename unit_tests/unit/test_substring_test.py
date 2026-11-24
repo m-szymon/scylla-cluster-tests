@@ -21,6 +21,7 @@ reads as "no measurement" rather than as an error.
 """
 
 import dataclasses
+import importlib.util
 import logging
 import os
 import re
@@ -1164,6 +1165,18 @@ def test_a_tie_value_is_what_the_script_derives():
     with open(sct_abs_path(f"{substring_test.SUBSTRING_BASE_DIR}/substring.rn"), encoding="utf-8") as f:
         source = f.read()
     assert "((sort % 1000003) * 7919 + 13) % 1000003 % TIE_VALUES" in source
+
+
+def test_the_scattered_order_is_the_index_nodes():
+    """derive_order_qrels.py's default order of partitions is the node's order::scattered_key, whose test pins these."""
+    spec = importlib.util.spec_from_file_location(
+        "derive_order_qrels", sct_abs_path(f"{substring_test.SUBSTRING_BASE_DIR}/derive_order_qrels.py")
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    assert script.scattered_key(-4069959284402364209) == 17617827331281151840
+    assert script.scattered_key(-3248873570005575792) == 3357659323546929151
+    assert script.table_key("a")[0] == script.scattered_key(script.token_key("a")[0])
 
 
 def test_the_changes_an_index_took_in_count_every_reader():
