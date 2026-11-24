@@ -33,9 +33,12 @@ datasets:
       - label: table
         order: table
         options: {segment_rows: '20000'}
+      # The tier index keeps its ties in the order of a scan ('partition_order' 'token'), the table
+      # index in the default 'scattered': one run checks both values. Two indexes without
+      # order_by on one column would not do: a plain LIKE fits both, and ScyllaDB takes the first.
       - label: tier
         order: tie
-        options: {segment_rows: '20000'}
+        options: {segment_rows: '20000', partition_order: 'token'}
       - label: time
         options: {segment_rows: '20000'}
     defaults:
@@ -59,18 +62,18 @@ datasets:
           - {set: char4_rare_table, qrels: true, check_order: true, variants: [table]}
           - {set: char8_common_table, qrels: true, check_order: true, variants: [table]}
           - {set: char12_common_table, qrels: true, check_order: true, variants: [table]}
-          - {set: char1_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char2_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char4_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char8_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char16_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char32_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: miss_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char1_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char2_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char4_rare_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char8_common_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
-          - {set: char12_common_tier, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char1_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char2_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char4_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char8_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char16_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char32_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: miss_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char1_rare_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char2_rare_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char4_rare_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char8_common_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
+          - {set: char12_common_tier_token, ordered: true, order_column: tier, qrels: true, variants: [tier]}
           - {set: char1_asc, ordered: true, order: asc, qrels: true, variants: [time]}
           - {set: char2_asc, ordered: true, order: asc, qrels: true, variants: [time]}
           - {set: char4_asc, ordered: true, order: asc, qrels: true, variants: [time]}
