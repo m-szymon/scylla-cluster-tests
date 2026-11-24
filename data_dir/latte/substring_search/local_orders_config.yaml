@@ -3,10 +3,12 @@
 # local_matrix_config.yaml checks ORDER BY register_time DESC. This plan checks the rest of what a
 # pattern index can be asked, on the same 1M names capped at 20k rows a segment:
 #
-# - an index with no order_by answers a plain LIKE in table order (token, then key): '<set>_table',
-#   with the order checked ('check_order');
+# - an index with no order_by answers a plain LIKE in its table order (the partition's place, then
+#   key; the place is a fixed scramble of the token by default): '<set>_table', with the order
+#   checked ('check_order');
 # - an index with 'order_by': 'tier DESC' -- five values, so most rows tie -- answers ORDER BY tier
-#   DESC with the ties in table order: '<set>_tier';
+#   DESC with the ties in table order, here by token ('partition_order': 'token'):
+#   '<set>_tier_token';
 # - the register_time index answers ORDER BY register_time ASC: '<set>_asc'.
 #
 # The ground truth comes from derive_order_qrels.py, run once on the derived corpus:
