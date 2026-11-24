@@ -1,0 +1,62 @@
+# Table order and tier order with the partitions scattered, on AWS.
+#
+# Run 0818814c (aws_orders_config, 2026-11-23) had the table and tier phases at 9,400 q/s with one
+# ScyllaDB shard at 100% and the node at 49%: in token order the first page of every frequent
+# keyword is the ring's lowest tokens, one tablet, and its shard read the rows of every page. The
+# time orders, read from every shard, reached 17,000 q/s. Since then an index keeps its partitions
+# by a fixed scramble of the token unless created with 'partition_order': 'token' (vector-store
+# 5e21e05). This run repeats the table and tier phases of that plan on such indexes; run 0818814c
+# is its baseline, since two indexes without order_by cannot share a column (a plain LIKE fits
+# both). Expected: db_reactor_max_shard_pct near db_reactor_busy_pct, and the q/s of the time
+# orders.
+#
+# The same dataset and the same three indexes as aws_orders_config, so that the load, the ingest
+# and the settling are comparable (catch-up 743 s there); the time index is built and not queried.
+# The ScyllaDB package may be the one of run 0818814c (0c9559b487): the option is the index
+# node's, and the plan leaves it at its default.
+#   MODE=release PKG=<scylla-unified-...> PLAN=aws_partition_config VS_TYPE=r8g.xlarge port_aws_chain.sh
+#
+# Budget: about 1:15 -- provisioning ~20 min, load and ingest ~35 min, 13 phases and 2 profiles
+# ~20 min, teardown.
+datasets:
+  - name: names_10M_matrix
+    index_during_load: true
+    max_index_wait_secs: 7200
+    max_shard_load_secs: 7200
+    max_settle_secs: 1800
+    index_variants:
+      - label: table
+        order: table
+        options: {}
+      - label: tier
+        order: tie
+        options: {}
+      - label: time
+        options: {}
+    defaults:
+      limit: 20
+      duration: 60s
+      stress_options: {concurrency: 64}
+      rate: 0
+      expected_p99_read_ms: 100
+    steps:
+      - shards: [0..9]
+        queries:
+          - {set: char2, profile: true, variants: [table]}
+          # The same query from 16 and from 256 clients. The phases run 64 in a closed loop, so
+          # their q/s is 64 over the time a query takes: run a2b5883f's profile of the phase
+          # above had the DB node a third idle at 8,600 q/s. If the q/s follows the clients, the
+          # phases measure latency and there is room; if it stays, something takes the requests
+          # one after another, and the CPU columns and thread states say on which node.
+          - {set: char2, stress_options: {concurrency: 16}, variants: [table]}
+          - {set: char2, stress_options: {concurrency: 256}, variants: [table]}
+          - {set: char8_common, variants: [table]}
+          - {set: miss, variants: [table]}
+          - {set: char2, write_rate: 2000, variants: [table]}
+          - {set: char2, write_rate: 5000, variants: [table]}
+          - {set: char8_common, write_rate: 5000, variants: [table]}
+          - {set: char2, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char8_common, ordered: true, order_column: tier, profile: true, variants: [tier]}
+          - {set: miss, ordered: true, order_column: tier, variants: [tier]}
+          - {set: char2, ordered: true, order_column: tier, write_rate: 5000, variants: [tier]}
+          - {set: char8_common, ordered: true, order_column: tier, write_rate: 5000, variants: [tier]}
